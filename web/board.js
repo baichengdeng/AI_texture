@@ -118,7 +118,7 @@
     applyImgSrc();
   }
 
-  function fitView() {
+  function fitView(opts = {}) {
     const r = wrap.getBoundingClientRect();
     if (!board.items.length || r.width < 40) {
       board.scale = 1; board.panX = 120; board.panY = 80;
@@ -131,11 +131,35 @@
     }
     const bw = Math.max(1, maxX - minX), bh = Math.max(1, maxY - minY);
     const pad = 72;
-    const s = clamp(Math.min((r.width - pad * 2) / bw, (r.height - pad * 2) / bh), 0.08, 1.5);
+    const fit = Math.min((r.width - pad * 2) / bw, (r.height - pad * 2) / bh);
+    // min：整块太大时不要一路缩到看不清（节点图用它保底），缩到下限后靠平移看其余部分
+    const s = clamp(fit, opts.min || 0.08, 1.5);
     board.scale = s;
-    board.panX = (r.width - bw * s) / 2 - minX * s;
-    board.panY = (r.height - bh * s) / 2 - minY * s;
+    if (fit < (opts.min || 0.08)) {
+      // 已经缩到下限还装不下：从左上角开始显示，而不是居中
+      board.panX = pad - minX * s;
+      board.panY = pad - minY * s;
+    } else {
+      board.panX = (r.width - bw * s) / 2 - minX * s;
+      board.panY = (r.height - bh * s) / 2 - minY * s;
+    }
     applyTransform(); updateSelToolbar(); applyImgSrc();
+  }
+
+  /* 把某个节点放到视口中央（按给定比例）。节点图导入后用它落在可读比例上，
+     想看全貌按 F（适应全部）。 */
+  function centerOn(id, scale = 0.9) {
+    const n = nodeById(id);
+    if (!n) return false;
+    const r = wrap.getBoundingClientRect();
+    if (r.width < 40) return false;
+    board.scale = clamp(scale, 0.08, 4);
+    board.panX = r.width / 2 - (n.x + n.w / 2) * board.scale;
+    board.panY = r.height / 2 - (n.y + n.h / 2) * board.scale;
+    applyTransform();
+    updateSelToolbar();
+    applyImgSrc();
+    return true;
   }
 
   function zoomAtCenter(factor) { setZoom(board.scale * factor); }
@@ -453,6 +477,7 @@ function comfyNodeHTML(it) {
   }
 
   function render() {
+    if (editingCommit) stopTextEdit();   // 重建 DOM 前先提交正在编辑的文本
     canvas.innerHTML = "";
     const svg = document.createElementNS(svgNS, "svg");
     svg.setAttribute("class", "edge-layer");
@@ -484,7 +509,11 @@ function comfyNodeHTML(it) {
     el.addEventListener("mousedown", (ev) => {
       if (ev.button !== 0) return;
       if (spaceDown) return;                 // 空格按住时交给画布平移
-      if (editingText === it.id) return;
+      if (editingText === it.id) {
+        // 点在编辑框里：交给浏览器放光标；点在框外：结束编辑再照常处理
+        if (ev.target.closest(".b-text-body")) return;
+        stopTextEdit();
+      }
       if (ev.target.classList.contains("anchor")) {
         startLink(ev, it, ev.target.dataset.side);
         return;
@@ -581,17 +610,32 @@ function comfyNodeHTML(it) {
   }
 
   /* ---------- 文本编辑 ---------- */
+  /* 编辑状态的提交函数。放在外面，好让"点到框外""重新渲染"都能主动收尾，
+     不会因为 blur 没触发而把节点卡在编辑态（那样就再也拖不动了）。 */
+  let editingCommit = null;
+
+  function stopTextEdit() {
+    const fn = editingCommit;
+    editingCommit = null;
+    editingText = null;
+    if (fn) { try { fn(); } catch { /* 提交失败也不阻塞 */ } }
+  }
+
   function startTextEdit(it, el) {
     const body = el.querySelector(".b-text-body");
     if (!body) return;
+    if (editingText === it.id) return;
+    if (editingCommit) stopTextEdit();
     editingText = it.id;
     el.classList.add("editing");
     body.classList.add("editing");
     body.contentEditable = "true";
     body.focus();
     try { document.getSelection().selectAllChildren(body); } catch { /* ignore */ }
+
     const done = () => {
-      if (editingText !== it.id) return;
+      if (editingCommit !== done) return;
+      editingCommit = null;
       editingText = null;
       body.contentEditable = "false";
       body.classList.remove("editing");
@@ -599,6 +643,8 @@ function comfyNodeHTML(it) {
       it.text = body.innerText.replace(/\n$/, "");
       markDirty();
     };
+    editingCommit = done;
+
     body.addEventListener("blur", done, { once: true });
     body.addEventListener("keydown", (ev) => {
       ev.stopPropagation();
@@ -1059,7 +1105,10 @@ function comfyNodeHTML(it) {
     render();
     if (pendingFit || (!localStorage.getItem("texture.view." + board.id) && board.items.length)) {
       pendingFit = false;
-      fitView();
+      // 含节点图的画板：以可读比例打开（节点里的参数要看得清），看全貌按 F；
+      // 其余画板照常整块适应。
+      const hasComfy = board.items.some((n) => n.type === "comfy");
+      fitView(hasComfy ? { min: 0.8 } : {});
     }
     setStatus("");
     syncToolbar();
@@ -1285,7 +1334,11 @@ function comfyNodeHTML(it) {
       render();
       setStatus("已保存", "ok");
       toast(`已放入 ${res.nodes} 个节点、${res.edges} 条连线`);
-      if (opts.fit !== false) fitView();
+      // 节点图往往很宽，整块 fit 会把字缩到看不清：
+      // 先落在结果那一端（可读比例），要看全貌按 F。
+      if (opts.fit !== false) {
+        if (!res.imageNode || !centerOn(res.imageNode, 0.85)) fitView({ min: 0.5 });
+      }
       if (typeof switchView === "function" && !$("#view-grid").hidden) {
         pendingFit = true;
         switchView("board");

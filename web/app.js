@@ -628,6 +628,7 @@ function fillInspector(meta) {
   favBtn.textContent = meta.fav ? "★ 已收藏" : "☆ 收藏";
   favBtn.classList.toggle("on", meta.fav);
   renderTagChips(meta);
+  loadGraphTab(meta, fid);
   const rows = [
     ["来源", meta.tool || meta.source],
     ["模型", params.model], ["采样器", params.sampler],
@@ -688,6 +689,156 @@ function renderTagChips(meta) {
     });
     wrap.appendChild(s);
   }
+}
+
+/* ---------------- 节点图（ComfyUI） ---------------- */
+
+const graphCache = new Map();
+let graphShown = null;   // 当前渲染的节点图数据
+
+function loadGraphTab(meta, fid) {
+  const btn = $("#tab-btn-graph");
+  const isComfy = meta && meta.source === "comfyui";
+  btn.hidden = !isComfy;
+  if (!isComfy) {
+    // 切走时不要把"节点图"页留在前台
+    if (!$("#tab-graph").hidden) showTab("params");
+    graphShown = null;
+    return;
+  }
+  renderGraph(fid);
+}
+
+function showTab(name) {
+  document.querySelectorAll(".lb-tabs button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll(".tab-body").forEach((b) => (b.hidden = true));
+  const el = $("#tab-" + name);
+  if (el) el.hidden = false;
+  if (name === "graph" && graphShown) {
+    // 页签从隐藏变为可见后才能量到宽度，这里重算一次比例
+    $("#graph-view").innerHTML = graphSVG(graphShown);
+    bindGraphPreview($("#graph-view"));
+  }
+}
+
+async function renderGraph(fid) {
+  const view = $("#graph-view");
+  const empty = $("#graph-empty");
+  const note = $("#graph-note");
+  if (!fid) return;
+
+  let data = graphCache.get(fid);
+  if (!data) {
+    view.innerHTML = '<div class="graph-loading">读取节点图…</div>';
+    try {
+      data = await api("/api/graph/" + encodeURIComponent(fid));
+    } catch (e) {
+      view.innerHTML = "";
+      empty.hidden = false;
+      empty.textContent = "读取节点图失败：" + (e && e.message ? e.message : e);
+      note.textContent = "";
+      return;
+    }
+    graphCache.set(fid, data);
+  }
+  if (state.selected !== fid) return;   // 用户已经切到别的图
+  graphShown = data.ok ? data : null;
+
+  if (!data.ok) {
+    view.innerHTML = "";
+    empty.hidden = false;
+    empty.textContent = data.note || "这张图里没有可用的节点图。";
+    note.textContent = "";
+    return;
+  }
+
+  empty.hidden = true;
+  const wide = graphIsWide(data);
+  note.textContent = `${data.nodes.length} 个节点 │ ${data.links.length} 条连线 │ ` +
+    (data.source === "workflow" ? "按原工作流排版" : "自动排版") +
+    (wide ? " │ 缩略图" : "");
+  view.innerHTML = graphSVG(data);
+  bindGraphPreview(view);
+}
+
+/* 节点图预览：装得下就按原样画（文字可读、必要时横向滚动）；
+   装不下就画成缩略图——只留方块，名字放到悬停提示里，形状和流程仍看得出。 */
+function graphSVG(data) {
+  const nodes = data.nodes || [];
+  if (!nodes.length) return "";
+  const links = data.links || [];
+  const pad = 16;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of nodes) {
+    minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
+    maxX = Math.max(maxX, n.x + n.w); maxY = Math.max(maxY, n.y + n.h);
+  }
+  const bw = Math.max(1, maxX - minX), bh = Math.max(1, maxY - minY);
+  const vw = bw + pad * 2, vh = bh + pad * 2;
+
+  const view = $("#graph-view");
+  const avail = (view && view.clientWidth) || 320;
+  const fit = avail / vw;
+  const mini = fit < 0.5;                       // 太小就不画字，改缩略图
+  const scale = mini ? fit : Math.max(0.62, Math.min(1, fit));
+
+  const pos = new Map(nodes.map((n) => [n.id, n]));
+  const paths = [];
+  for (const l of links) {
+    const a = pos.get(l.from), b = pos.get(l.to);
+    if (!a || !b) continue;
+    const ac = { x: a.x - minX + pad + a.w / 2, y: a.y - minY + pad + a.h / 2 };
+    const bc = { x: b.x - minX + pad + b.w / 2, y: b.y - minY + pad + b.h / 2 };
+    const h = Math.max(20, Math.abs(bc.x - ac.x) * 0.45);
+    paths.push(`<path class="g-edge" d="M ${ac.x} ${ac.y} C ${ac.x + h} ${ac.y}, ` +
+      `${bc.x - h} ${bc.y}, ${bc.x} ${bc.y}"></path>`);
+  }
+
+  const boxes = nodes.map((n) => {
+    const x = n.x - minX + pad, y = n.y - minY + pad;
+    const w = Math.max(24, n.w), h = Math.max(16, n.h);
+    const label = esc(n.title || n.type || "Node");
+    const tip = esc(`${n.title || n.type || "Node"}${n.type && n.type !== n.title ? " · " + n.type : ""}`);
+    const muted = n.muted ? " muted" : "";
+    if (mini) {
+      return `<g class="g-node mini${muted}"><title>${tip}</title>` +
+        `<rect x="${x}" y="${y}" width="${w}" height="${h}"></rect></g>`;
+    }
+    const cls = n.type && n.type !== n.title ? esc(n.type) : "";
+    const sub = cls && w > 90
+      ? `<text class="g-cls" x="${x + 6}" y="${y + h - 6}">${cls}</text>` : "";
+    return `<g class="g-node${muted}"><title>${tip}</title>` +
+      `<rect x="${x}" y="${y}" width="${w}" height="${h}"></rect>` +
+      `<text class="g-title" x="${x + 6}" y="${y + 15}">${label}</text>${sub}</g>`;
+  }).join("");
+
+  const cls = "graph-svg" + (mini ? " mini" : "");
+  return `<svg class="${cls}" viewBox="0 0 ${Math.round(vw)} ${Math.round(vh)}"` +
+    ` width="${Math.round(vw * scale)}" height="${Math.round(vh * scale)}"` +
+    ` role="img" aria-label="ComfyUI 节点图：${nodes.length} 个节点、${links.length} 条连线">` +
+    `<g class="g-edges">${paths.join("")}</g>${boxes}</svg>`;
+}
+
+/* 这张图是否只能画成缩略图（装不下就缩到 50% 以下） */
+function graphIsWide(data) {
+  const nodes = data.nodes || [];
+  if (!nodes.length) return false;
+  let minX = Infinity, maxX = -Infinity;
+  for (const n of nodes) { minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x + n.w); }
+  const view = $("#graph-view");
+  const avail = (view && view.clientWidth) || 320;
+  return (maxX - minX + 32) > avail / 0.5;
+}
+
+/* 悬停节点时高亮它的连线（纯 CSS 做不到跨元素，用一点脚本） */
+function bindGraphPreview(view) {
+  const svg = view.querySelector("svg");
+  if (!svg) return;
+  svg.querySelectorAll(".g-node").forEach((g) => {
+    g.addEventListener("pointerenter", () => g.classList.add("hot"));
+    g.addEventListener("pointerleave", () => g.classList.remove("hot"));
+  });
 }
 
 function currentFileId() {
@@ -924,12 +1075,18 @@ function bindEvents() {
     loadTags();
   });
   document.querySelectorAll(".lb-tabs button").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      document.querySelectorAll(".lb-tabs button").forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
-      document.querySelectorAll(".tab-body").forEach((b) => (b.hidden = true));
-      $("#tab-" + btn.dataset.tab).hidden = false;
-    });
+    btn.addEventListener("click", () => showTab(btn.dataset.tab));
+  });
+  $("#graph-to-board").addEventListener("click", async () => {
+    const fid = currentFileId();
+    if (!fid) return;
+    if (typeof window.addGraphToBoard !== "function") { toast("画板尚未就绪"); return; }
+    const btn = $("#graph-to-board");
+    btn.setAttribute("aria-busy", "true");
+    const n = await window.addGraphToBoard(fid);
+    btn.removeAttribute("aria-busy");
+    if (n) btn.textContent = "已送入";
+    setTimeout(() => { btn.textContent = "送入画板"; }, 1800);
   });
   document.querySelectorAll(".copy[data-copy]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -959,7 +1116,7 @@ function bindEvents() {
   $("#grid").classList.toggle("uniform", state.layout === "uniform");
 
   /* 主题 */
-  applyTheme(localStorage.getItem("texture.theme") || "dark");
+  applyTheme(localStorage.getItem("texture.theme") || "light");
   $("#set-theme").addEventListener("click", () => {
     const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
     applyTheme(next);

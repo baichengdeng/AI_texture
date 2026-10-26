@@ -56,9 +56,24 @@ python run.py --port 9000         # 换端口（前后端同一端口）
 - **导出互转**：A1111 parameters 文本（NovelAI 采样器自动映射）、ComfyUI workflow/prompt JSON
 - **原生桌面窗口**：pywebview/WebView2；浏览器原生弹窗已替换为双模式模态框，`--web` 回退保留
 
+### ComfyUI 节点图
+
+ComfyUI 生成的图里带着两段 JSON，本程序把它们还原成一张能看的节点图：
+
+- `workflow`（UI 格式）有节点位置、尺寸、连线与分组 → **按作者当时的排版画**
+- `prompt`（API 格式）有具名输入 → **补出每个参数叫什么**（`steps`、`cfg`、`sampler_name`…）
+- 只有 API 格式时按最长路径分层，自动排一遍（上游在左、结果在右）
+
+两处能用：
+
+- **信息栏 →「节点图」页签**：按比例画出节点与连线，节点数、连线数是真实计数；图太宽时自动切成缩略图，名字放在悬停提示里。页签只在 ComfyUI 图片上出现。
+- **「送入画板」**（页签里的按钮，或图片节点右键「节点图送入画板」）：把整张节点图变成画板节点——每个 ComfyUI 节点是一个带标题和参数的方框，连线变成画板的边，工作流分组变成分组节点，**并把这张图本身作为一个图片节点接在输出节点（SaveImage）后面**。同一张图可以重复送入，节点 id 自动避让，不会串线。
+
+节点框里的参数值是真实数据；画板右键还有「复制节点参数」「选中上游节点」。导出 `.canvas` 时节点图节点写成文本节点（参数逐行保留），导出自包含 HTML 时画成带参数的方框，都不会丢内容。
+
 ### 无限画板（Obsidian Canvas 式）
 
-- **节点类型**：图片 / 文本 / 链接 / 分组；节点 `id` 与图片指纹 `fileId` 分离，**同一张图可重复放上画板**
+- **节点类型**：图片 / 文本 / 链接 / 分组 / ComfyUI 节点；节点 `id` 与图片指纹 `fileId` 分离，**同一张图可重复放上画板**
 - **文本节点**：默认 240×160，尺寸只由拖右下角决定，**不会随输入自动变高**；内容超出时在框内滚动。双击空白新建，双击节点进入编辑，`Esc` 结束
 - **交互**：框选、Shift/Ctrl 加选、成组拖动、八向…四向锚点拖出连线、四角缩放（Alt 自由比例）、双击空白新建文本
 - **连线**：贝塞尔曲线、可编辑标签、箭头（末端/双向）、6 色
@@ -90,6 +105,7 @@ app/
   store.py             SQLite：根目录/收藏/标签/画板/元数据缓存（含 v1 画板节点兼容归一化）
   thumbnails.py        缩略图缓存（透明底合成白底）
   export.py            A1111 文本 / workflow JSON / Obsidian .canvas / 画板自包含 HTML
+  comfy_graph.py       ComfyUI 节点图解析（workflow 排版 + prompt 参数名 → 节点图 → 画板）
   metadata/            ← 3 个独立读取器 + 接口路由（可单独运行）
     reader_a1111.py      python -m app.metadata.reader_a1111 <图片>
     reader_comfyui.py    python -m app.metadata.reader_comfyui <图片>
@@ -99,12 +115,13 @@ app/
 web/                   无构建步骤的原生前端
   index.html           三段式骨架（顶栏 / 侧栏 / 视图 + 信息栏）
   style.css            中性灰设计系统（深浅两套变量）
-  app.js               图库：文件夹树 / 过滤 / 瀑布流 / 灯箱 / 多选 / 信息栏
-  board.js             画板：无限画布 / 连线 / 多选 / 视口记忆 / 自动保存 / .canvas
+  app.js               图库：文件夹树 / 过滤 / 瀑布流 / 灯箱 / 多选 / 信息栏 / 节点图预览
+  board.js             画板：无限画布 / 连线 / 多选 / 视口记忆 / 自动保存 / .canvas / 节点图
   dialogs.js           双模式弹窗与文件夹选择（原生桥 / 浏览器回退）
 tests/
   make_fixtures.py     生成 9 张各格式测试图
   test_readers.py      43 项断言（python tests/test_readers.py）
+  test_comfy_graph.py  37 项断言（python tests/test_comfy_graph.py）
 ```
 
 ## 性能

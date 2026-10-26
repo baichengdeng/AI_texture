@@ -17,3 +17,11 @@ data/
 Thumbs.db
 
 references/
+
+# 临时文件与日志
+.tmp/
+*.log
+
+# 编辑器
+.vscode/
+.idea/

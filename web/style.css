@@ -52,6 +52,8 @@
 
   --nav-w: 12rem;
   --top-h: 3.25rem;
+  --tri-h: 3px;
+  --chrome-h: calc(var(--top-h) + var(--tri-h));
   --insp-w: 23rem;
 
   color-scheme: light;
@@ -91,11 +93,24 @@ body {
   -webkit-font-smoothing: antialiased;
   display: grid;
   grid-template-columns: var(--nav-w) minmax(0, 1fr);
-  grid-template-rows: var(--top-h) minmax(0, 1fr);
+  grid-template-rows: var(--tri-h) var(--top-h) minmax(0, 1fr);
   grid-template-areas:
+    "tri tri"
     "top top"
     "side main";
 }
+
+/* 三色条：3px，品红 / 强调色 / 薄荷绿三等分。整页只此一处。 */
+.tri {
+  grid-area: tri;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  height: var(--tri-h);
+  transform-origin: left;
+}
+.tri > i:nth-child(1) { background: #ff00f0; }
+.tri > i:nth-child(2) { background: var(--signal); }
+.tri > i:nth-child(3) { background: #00ffa2; }
 
 body.nav-closed { grid-template-columns: 0 minmax(0, 1fr); }
 
@@ -1705,6 +1720,7 @@ body.nav-closed #selection-bar { left: 50%; }
 }
 
 @media (prefers-reduced-motion: no-preference) {
+  .tri { animation: tri-sweep 600ms var(--ease) both; }
   #view-grid.view-in,
   #view-board.view-in { animation: come 320ms var(--snap) both; }
 
@@ -1722,6 +1738,10 @@ body.nav-closed #selection-bar { left: 50%; }
   #insp-body.swap { animation: come 200ms var(--snap) both; }
 }
 
+@keyframes tri-sweep {
+  from { transform: scaleX(0); }
+  to { transform: none; }
+}
 @keyframes come {
   from { opacity: 0; transform: translateX(-10px); clip-path: inset(0 100% 0 0); }
   to { opacity: 1; transform: none; clip-path: inset(0 -2% 0 0); }
@@ -1757,7 +1777,7 @@ body.nav-closed #selection-bar { left: 50%; }
      收起时完全移出视口（桌面端则收成 0 宽的一列）。 */
   #sidebar {
     position: fixed;
-    top: var(--top-h);
+    top: var(--chrome-h);
     bottom: 0;
     left: 0;
     z-index: 40;
@@ -1883,3 +1903,73 @@ body.nav-closed #selection-bar { left: 50%; }
 /* 输出结果（生成出来的这张图）与节点图之间的关系：用一条带标签的边连过去 */
 .b-item.b-comfy.muted { opacity: 0.55; }
 .b-item.b-comfy.muted .b-comfy-head { border-bottom-style: dashed; }
+
+/* ---------- 19. 信息栏里的节点图预览 ---------- */
+
+.graph-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+.graph-head .field { flex: 1; min-width: 0; }
+.graph-view {
+  border: 1px solid var(--rule);
+  background: var(--panel);
+  overflow: auto;
+  max-height: 24rem;
+  scrollbar-width: thin;
+}
+.graph-view::-webkit-scrollbar { width: 8px; height: 8px; }
+.graph-view::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); }
+.graph-loading {
+  padding: 1.2rem 0.8rem;
+  color: var(--ink-2);
+  font-size: 0.8125rem;
+  text-align: center;
+}
+.graph-empty {
+  margin: 0.5rem 0 0;
+  color: var(--ink-2);
+  font-size: 0.8125rem;
+  line-height: 1.7;
+}
+.graph-svg {
+  display: block;
+  max-width: none;
+  font-family: var(--font-ui);
+}
+.g-edge {
+  fill: none;
+  stroke: var(--ink-2);
+  stroke-width: 1.2;
+  opacity: 0.55;
+}
+.g-node rect {
+  fill: var(--panel);
+  stroke: var(--ink);
+  stroke-width: 1;
+}
+.g-node .g-title {
+  fill: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+  font-stretch: var(--wide);
+}
+.g-node .g-cls {
+  fill: var(--ink-2);
+  font-size: 9px;
+  font-stretch: var(--wide);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.g-node.muted { opacity: 0.5; }
+.g-node.muted rect { stroke-dasharray: 3 3; }
+.g-node.hot rect { fill: var(--signal); }
+.g-node.hot .g-title { fill: var(--on-signal); }
+
+/* 缩略图模式：方块代表节点，名字在悬停提示里 */
+.graph-svg.mini .g-node rect { fill: var(--chip); }
+.graph-svg.mini .g-node.hot rect { fill: var(--signal); }
+.graph-svg.mini .g-edge { stroke-width: 2; opacity: 0.4; }
+.graph-svg .g-node { cursor: help; }
