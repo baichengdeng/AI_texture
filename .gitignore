@@ -1,0 +1,19 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 虚拟环境
+.venv/
+venv/
+
+# 你的本地数据（图片库、数据库等）
+data/
+
+# 密钥/配置
+.env
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+references/

@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Texture — AI 图片库与参考画板</title>
+<meta name="theme-color" content="#F4F4F2" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#191919" media="(prefers-color-scheme: dark)">
+<script>
+  try {
+    const t = localStorage.getItem("texture.theme");
+    if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+  } catch {}
+</script>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23161616'/%3E%3Cpath d='M4 4.5h8M8 4.5v7' stroke='%23FFFA00' stroke-width='1.8' stroke-linecap='square'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- 顶栏：命令栏，两套主题都是深色 -->
+<header id="topbar">
+  <button id="nav-toggle" type="button" aria-label="侧栏 (N)" title="侧栏 (N)">☰</button>
+  <a class="brand" href="#" title="Texture">
+    <span class="seal" aria-hidden="true">T</span>
+    <span class="name">TEXTURE</span>
+  </a>
+
+  <nav id="view-switch" aria-label="视图">
+    <button type="button" data-view="grid" class="active" aria-current="page">图库<small>Library</small></button>
+    <button type="button" data-view="board">画板<small>Board</small></button>
+  </nav>
+
+  <div class="search-wrap">
+    <span class="search-ico" aria-hidden="true">⌕</span>
+    <input id="search" type="search" placeholder="提示词 / 文件名，逗号＝同时包含" autocomplete="off" aria-label="搜索">
+    <button id="search-clear" class="search-clear" type="button" title="清空搜索" hidden>✕</button>
+  </div>
+
+  <div class="ops">
+    <button id="btn-add-root" class="btn primary" type="button">添加文件夹</button>
+    <div class="tb-menu-wrap">
+      <button id="btn-settings" class="icon-btn" type="button" title="设置">⚙</button>
+      <div class="tb-menu align-right" id="settings-menu" hidden>
+        <button class="ctx-item" id="set-theme" type="button">切换深浅</button>
+        <button class="ctx-item" id="set-shortcuts" type="button">键盘快捷键</button>
+        <div class="ctx-sep"></div>
+        <button class="ctx-item" id="set-rescan" type="button">重新扫描全部文件夹</button>
+      </div>
+    </div>
+    <span id="stat" class="stat">000 张</span>
+  </div>
+</header>
+
+<!-- 侧栏：竖排导航，当前项整格黄 -->
+<aside id="sidebar">
+  <div class="sb-top">
+    <span class="sb-title">Library</span>
+    <button id="nav-pin" class="pin-btn" type="button" title="固定后，选择文件夹不会自动收起侧栏">固定</button>
+  </div>
+
+  <ul id="lib-list" class="nav-list"></ul>
+
+  <div class="sb-section" id="sec-folders">
+    <div class="sec-head" title="点击折叠 / 展开">
+      <span class="zh">Folders / 文件夹</span>
+      <button class="sec-op" id="btn-rescan" type="button" title="重新扫描全部根目录">↻</button>
+      <span class="chev" aria-hidden="true">▾</span>
+    </div>
+    <div class="sec-body"><div class="sec-inner">
+      <ul id="folder-tree" class="nav-list tree"></ul>
+    </div></div>
+  </div>
+
+  <div class="sb-section" id="sec-filters">
+    <div class="sec-head" title="点击折叠 / 展开">
+      <span class="zh">Filters / 筛选</span>
+      <span class="chev" aria-hidden="true">▾</span>
+    </div>
+    <div class="sec-body"><div class="sec-inner">
+      <div class="filter-stack">
+        <select id="f-source" aria-label="来源">
+          <option value="">全部来源</option>
+          <option value="comfyui">ComfyUI</option>
+          <option value="a1111">A1111 WebUI</option>
+          <option value="novelai">NovelAI</option>
+          <option value="invokeai">InvokeAI</option>
+          <option value="easydiffusion">Easy Diffusion</option>
+          <option value="fooocus">Fooocus</option>
+          <option value="swarmui">StableSwarmUI</option>
+          <option value="drawthings">Draw Things</option>
+          <option value="none">无元数据</option>
+        </select>
+        <select id="f-model" aria-label="模型"><option value="">全部模型</option></select>
+        <select id="f-sampler" aria-label="采样器"><option value="">全部采样器</option></select>
+        <select id="f-ratio" aria-label="尺寸">
+          <option value="">全部尺寸</option>
+          <option value="landscape">横版</option>
+          <option value="portrait">竖版</option>
+          <option value="square">方形</option>
+        </select>
+      </div>
+    </div></div>
+  </div>
+
+  <div class="sb-section" id="sec-tags">
+    <div class="sec-head" title="点击折叠 / 展开">
+      <span class="zh">Tags / 标签</span>
+      <span class="chev" aria-hidden="true">▾</span>
+    </div>
+    <div class="sec-body"><div class="sec-inner">
+      <ul id="tag-list" class="nav-list"><li class="nav-row empty">暂无标签</li></ul>
+    </div></div>
+  </div>
+</aside>
+
+<main id="main">
+  <div id="views">
+    <!-- 图库 -->
+    <section id="view-grid" class="view-in">
+      <div id="gallery-toolbar">
+        <span id="grid-info" class="field"></span>
+        <label class="fav-row" title="只看收藏">
+          <input type="checkbox" id="f-fav"><span>仅收藏</span>
+        </label>
+        <div class="grow"></div>
+        <select id="f-sort" aria-label="排序">
+          <option value="time-desc">最新优先</option>
+          <option value="time-asc">最旧优先</option>
+          <option value="name-asc">文件名 A→Z</option>
+          <option value="name-desc">文件名 Z→A</option>
+          <option value="size-desc">文件大小 ↓</option>
+          <option value="size-asc">文件大小 ↑</option>
+          <option value="type-asc">文件类型</option>
+        </select>
+        <div id="layout-switch" class="seg" role="group" aria-label="布局">
+          <button type="button" data-layout="masonry" class="active" title="瀑布流">▤</button>
+          <button type="button" data-layout="uniform" title="等大网格">▦</button>
+        </div>
+        <input id="thumb-size" type="range" min="130" max="320" step="10" value="190" aria-label="缩略图大小">
+      </div>
+
+      <div id="grid" class="grid masonry"></div>
+      <div id="grid-empty" class="empty-hint" hidden>
+        <span id="grid-empty-text">图库是空的。点右上角「添加文件夹」，选一个存放生成图的目录，图片会出现在这里。</span>
+        <button id="btn-clear-filter" class="btn primary" type="button" hidden>清除过滤条件</button>
+      </div>
+    </section>
+
+    <!-- 画板 -->
+    <section id="view-board" hidden>
+      <div id="board-toolbar">
+        <select id="board-select" aria-label="切换画板"></select>
+        <button id="board-add-text" class="btn" type="button">＋ 文本</button>
+        <button id="drawer-toggle" class="btn ghost" type="button">素材</button>
+
+        <span class="tb-sep" aria-hidden="true"></span>
+        <div class="zoom-group">
+          <button id="zoom-out" class="icon-btn" type="button" title="缩小 (−)">−</button>
+          <button id="zoom-level" class="zoom-level" type="button" title="回到 100%">100%</button>
+          <button id="zoom-in" class="icon-btn" type="button" title="放大 (＋)">＋</button>
+          <button id="zoom-fit" class="btn" type="button" title="适应全部节点 (F)">适应</button>
+        </div>
+
+        <div class="grow"></div>
+
+        <div class="tb-menu-wrap">
+          <button class="btn ghost" type="button">导入 / 导出 ▾</button>
+          <div class="tb-menu">
+            <button id="board-export" class="ctx-item" type="button">导出 HTML（自包含）</button>
+            <button id="board-export-canvas" class="ctx-item" type="button">导出 Obsidian .canvas</button>
+            <button id="board-import-canvas" class="ctx-item" type="button">导入 Obsidian .canvas…</button>
+            <div class="ctx-sep"></div>
+            <button id="board-export-canvas-vault" class="ctx-item" type="button">导出 .canvas（指定库根…）</button>
+          </div>
+        </div>
+
+        <div class="tb-menu-wrap">
+          <button class="icon-btn" type="button" title="画板管理">⋯</button>
+          <div class="tb-menu align-right">
+            <button id="board-new" class="ctx-item" type="button">新建画板</button>
+            <button id="board-rename" class="ctx-item" type="button">重命名画板</button>
+            <button id="board-save" class="ctx-item" type="button">立即保存</button>
+            <div class="ctx-sep"></div>
+            <button id="board-delete" class="ctx-item danger" type="button">删除画板</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="drawer" class="collapsed"><div id="drawer-strip"></div></div>
+
+      <div id="board-wrap">
+        <div id="board-canvas"></div>
+        <div id="sel-toolbar" hidden>
+          <button id="sel-front" type="button" title="移到最前 (])">⬆</button>
+          <button id="sel-back" type="button" title="移到最后 ([)">⬇</button>
+          <button id="sel-dup" type="button" title="复制 (Ctrl+D)">⧉</button>
+          <button id="sel-label" type="button" title="编辑连线标签" hidden>标签</button>
+          <span class="sel-colors" id="sel-colors"></span>
+          <button id="sel-del" class="danger" type="button" title="删除 (Del)">✕</button>
+        </div>
+        <div id="board-hint" class="board-hint">
+          空白拖动＝框选 · 空格 / 中键拖动＝平移 · 滚轮缩放 · 双击图片看大图 · 右键更多
+        </div>
+      </div>
+    </section>
+
+    <!-- 灯箱 -->
+    <div id="lightbox" hidden>
+      <div id="lb-left">
+        <div id="lb-stage">
+          <img id="lb-img-under" alt="" aria-hidden="true">
+          <img id="lb-img" alt="">
+        </div>
+        <button class="lb-nav prev" id="lb-prev" type="button" title="上一张 (←)">‹</button>
+        <button class="lb-nav next" id="lb-next" type="button" title="下一张 (→)">›</button>
+        <button id="lb-close" type="button" title="关闭 (Esc)">✕</button>
+      </div>
+    </div>
+  </div>
+
+  <button id="insp-toggle" type="button" title="信息栏 (I)">›</button>
+
+  <aside id="inspector" aria-label="图片信息">
+    <div class="insp-preview"><img id="insp-thumb" alt=""></div>
+    <div class="insp-head">
+      <span id="lb-name">未选择图片</span>
+      <button id="insp-pin" class="pin-btn" type="button" title="固定后，放大看图时信息栏不收起">固定</button>
+    </div>
+    <div id="insp-empty">点左侧任意图片，这里显示它的提示词与参数。</div>
+    <div id="insp-body" hidden>
+      <div id="lb-fileinfo" class="insp-file field"></div>
+      <div class="lb-actions">
+        <button id="lb-fav" class="chip-btn" type="button">☆ 收藏</button>
+        <input id="lb-tag-input" placeholder="加标签，回车确认" aria-label="加标签">
+      </div>
+      <div id="lb-tag-chips" class="tag-chips"></div>
+
+      <div class="lb-tabs" role="tablist">
+        <button type="button" data-tab="params" class="active" role="tab">参数</button>
+        <button type="button" data-tab="prompt" role="tab">提示词</button>
+        <button type="button" data-tab="graph" role="tab" id="tab-btn-graph" hidden>节点图</button>
+        <button type="button" data-tab="raw" role="tab">原始 / 导出</button>
+      </div>
+      <div id="tab-params" class="tab-body"><table id="lb-param-table"></table><pre id="lb-setting"></pre></div>
+      <div id="tab-prompt" class="tab-body" hidden>
+        <label>正面提示词 <button class="btn mini copy" type="button" data-copy="pos">复制</button></label>
+        <pre id="lb-pos"></pre>
+        <label>负面提示词 <button class="btn mini copy" type="button" data-copy="neg">复制</button></label>
+        <pre id="lb-neg"></pre>
+      </div>
+      <div id="tab-graph" class="tab-body" hidden>
+        <div class="graph-head">
+          <span id="graph-note" class="field"></span>
+          <button id="graph-to-board" class="btn mini" type="button">送入画板</button>
+        </div>
+        <div id="graph-view" class="graph-view"></div>
+        <p id="graph-empty" class="graph-empty" hidden></p>
+      </div>
+      <div id="tab-raw" class="tab-body" hidden>
+        <div class="raw-actions">
+          <button id="lb-copy-a1111" class="btn mini" type="button">复制 A1111 文本</button>
+          <a id="lb-dl-workflow" class="btn mini" download hidden>下载 workflow.json</a>
+          <a id="lb-dl-img" class="btn mini" target="_blank" rel="noreferrer">打开原图</a>
+        </div>
+        <pre id="lb-raw"></pre>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<!-- 多选批量操作条 -->
+<div id="selection-bar" hidden>
+  <span id="sel-count" class="field"></span>
+  <button id="bsel-fav" class="btn mini" type="button">★ 收藏</button>
+  <button id="bsel-tag" class="btn mini" type="button">＋ 标签</button>
+  <button id="bsel-del" class="btn mini danger" type="button">移入回收站</button>
+  <button id="bsel-clear" class="btn mini ghost" type="button">取消选择</button>
+</div>
+
+<!-- 右键菜单 -->
+<div id="ctx-menu" hidden></div>
+
+<!-- 隐藏的文件选择器：导入 .canvas -->
+<input type="file" id="canvas-file" accept=".canvas,.json,application/json" hidden>
+
+<!-- 快捷键面板（? 呼出） -->
+<div id="shortcuts" hidden>
+  <div class="sc-mask"></div>
+  <div class="sc-box">
+    <div class="sc-head">Keyboard / 快捷键</div>
+    <table>
+      <tr><td>← →</td><td>图库：切换选中；灯箱内翻页</td></tr>
+      <tr><td>Enter</td><td>放大当前选中</td></tr>
+      <tr><td>Esc</td><td>关闭弹层 / 取消选择</td></tr>
+      <tr><td>Ctrl / Shift + 点击</td><td>多选 / 范围选择</td></tr>
+      <tr><td>Ctrl+A</td><td>全选</td></tr>
+      <tr><td>Delete · Ctrl+D</td><td>画板：删除 / 复制选中</td></tr>
+      <tr><td>Ctrl+C / Ctrl+V</td><td>画板：复制 / 粘贴节点</td></tr>
+      <tr><td>方向键</td><td>画板：微调选中（Shift ×10）</td></tr>
+      <tr><td>空格拖动 · 中键</td><td>画板：平移画布</td></tr>
+      <tr><td>F · 0 · ＋ / −</td><td>画板：适应全部 / 100% / 缩放</td></tr>
+      <tr><td>[ ]</td><td>画板：移到最后 / 最前</td></tr>
+      <tr><td>双击空白</td><td>画板：新建文本节点</td></tr>
+      <tr><td>I · N · ?</td><td>信息栏 · 侧栏 · 本面板</td></tr>
+    </table>
+  </div>
+</div>
+
+<script src="dialogs.js"></script>
+<script src="app.js"></script>
+<script src="board.js"></script>
+</body>
+</html>
