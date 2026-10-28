@@ -7,12 +7,21 @@ const customModal = (() => {
   let root = null;
   function open({ body, input = false, value = "", okText = "确定", danger = false }) {
     return new Promise((resolve) => {
+      let closed = false;
       const done = (v) => {
-        root.innerHTML = "";
-        root.style.display = "none";   // 容器本身也必须隐藏，否则 fixed 遮罩继续挡住页面
-        resolve(v);
+        if (closed) return;
+        closed = true;
+        // 退场：120ms 淡出后隐藏（与入场 200ms 对称的一半）
+        root.classList.add("closing");
+        setTimeout(() => {
+          root.classList.remove("closing");
+          root.innerHTML = "";
+          root.style.display = "none";   // 容器也隐藏，否则 fixed 遮罩挡住页面
+          resolve(v);
+        }, 120);
       };
       if (!root) { root = document.createElement("div"); root.id = "app-modal"; document.body.appendChild(root); }
+      root.classList.remove("closing");
       root.style.display = "";
       root.innerHTML = `
         <div class="am-mask"></div>

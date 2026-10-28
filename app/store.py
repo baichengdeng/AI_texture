@@ -21,7 +21,40 @@ CREATE TABLE IF NOT EXISTS boards(
 CREATE TABLE IF NOT EXISTS meta_cache(
     fid TEXT PRIMARY KEY, mtime REAL, size INTEGER, meta TEXT
 );
+CREATE TABLE IF NOT EXISTS tag_docs(
+    fid TEXT PRIMARY KEY, segs TEXT NOT NULL DEFAULT '[]', updated REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS seg_templates(
+    name TEXT PRIMARY KEY, segs TEXT NOT NULL DEFAULT '[]', updated REAL NOT NULL
+);
 """
+
+# TAG 分格：一格 = 一个主体名 + 一段自由文本。数量与长度都做上限，
+# 避免 AI 或误操作写进超大 JSON 把库撑坏。
+# 上限只做防护，不参与业务：空格子必须原样保留，否则前端「＋ 胶囊」
+# 刚加上还没填内容的格子会在下一次自动保存时被清掉（表现为只能建一格）。
+MAX_SEGS = 500
+MAX_SEG_KEY = 40
+MAX_SEG_BODY = 8000
+
+
+def clean_segs(raw) -> list:
+    """把任意输入洗成 [{k, v}]：k 是格子主体名，v 是这一格的内容。"""
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw[:MAX_SEGS]:
+        if isinstance(item, str):
+            k, v = "", item
+        elif isinstance(item, dict):
+            k = item.get("k", item.get("name", item.get("subject", "")))
+            v = item.get("v", item.get("body", item.get("text", "")))
+        else:
+            continue
+        k = str(k or "").strip()[:MAX_SEG_KEY]
+        v = str(v or "")[:MAX_SEG_BODY]
+        out.append({"k": k, "v": v})
+    return out
 
 
 class Store:
@@ -91,6 +124,25 @@ class Store:
             result.setdefault(r["name"], []).append(r["fid"])
         return result
 
+    def delete_tag(self, name: str) -> int:
+        """删除一个标签（所有图片上的该标签一并移除）。返回影响的行数。"""
+        with self._lock:
+            cur = self._db.execute("DELETE FROM tags WHERE name = ?", (name,))
+            self._db.commit()
+        return cur.rowcount
+
+    def rename_tag(self, old: str, new: str) -> int:
+        """重命名标签（所有图片同步改）。返回新名下的行数。"""
+        with self._lock:
+            self._db.execute(
+                "UPDATE OR IGNORE tags SET name = ? WHERE name = ?", (new, old)
+            )
+            self._db.execute("DELETE FROM tags WHERE name = ?", (old,))  # 与新名重名的旧行清掉
+            self._db.commit()
+        return self._db.execute(
+            "SELECT COUNT(*) FROM tags WHERE name = ?", (new,)
+        ).fetchone()[0]
+
     def add_tags(self, fid: str, names: list):
         with self._lock:
             for n in names:
@@ -107,6 +159,94 @@ class Store:
                 self._db.execute(
                     "DELETE FROM tags WHERE name = ? AND fid = ?", (n, fid)
                 )
+            self._db.commit()
+
+    # ---------- TAG 分格 ----------
+    def tag_doc(self, fid: str) -> list:
+        with self._lock:
+            r = self._db.execute(
+                "SELECT segs FROM tag_docs WHERE fid = ?", (fid,)
+            ).fetchone()
+        return clean_segs(json.loads(r["segs"])) if r else []
+
+    def set_tag_doc(self, fid: str, segs) -> list:
+        clean = clean_segs(segs)
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO tag_docs(fid, segs, updated) VALUES (?,?,?)",
+                (fid, json.dumps(clean, ensure_ascii=False), time.time()),
+            )
+            self._db.commit()
+        return clean
+
+    def tag_docs(self, fids: list) -> dict:
+        """批量读：{fid: [{k,v}, ...]}，没有内容的 fid 不出现在结果里。"""
+        if not fids:
+            return {}
+        marks = ",".join("?" * len(fids))
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT fid, segs FROM tag_docs WHERE fid IN ({marks})", list(fids)
+            ).fetchall()
+        out = {}
+        for r in rows:
+            segs = clean_segs(json.loads(r["segs"]))
+            if segs:
+                out[r["fid"]] = segs
+        return out
+
+    def all_tag_docs(self) -> dict:
+        """{fid: 纯文本}，供搜索时一次性建索引，避免逐张查库。"""
+        with self._lock:
+            rows = self._db.execute("SELECT fid, segs FROM tag_docs").fetchall()
+        out = {}
+        for r in rows:
+            segs = clean_segs(json.loads(r["segs"]))
+            if segs:
+                out[r["fid"]] = " ".join(
+                    f"{s['k']} {s['v']}".strip() for s in segs
+                )
+        return out
+
+    def copy_tag_docs(self, fids: list) -> list:
+        """把一批图片的 TAG 分格并起来作为模板候选（按出现顺序去重主体名）。"""
+        names = []
+        for segs in self.tag_docs(fids).values():
+            for s in segs:
+                if s["k"] and s["k"] not in names:
+                    names.append(s["k"])
+        return names
+
+    def templates(self) -> list:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT name, segs, updated FROM seg_templates ORDER BY updated DESC"
+            ).fetchall()
+        return [
+            {"name": r["name"], "segs": clean_segs(json.loads(r["segs"])),
+             "updated": r["updated"]}
+            for r in rows
+        ]
+
+    def save_template(self, name: str, segs) -> dict:
+        name = str(name or "").strip()[:MAX_SEG_KEY]
+        if not name:
+            raise ValueError("模板名不能为空")
+        # 模板 = 分格骨架：只记「有几格 + 每格叫什么」，
+        # 格子里的内容不保存 —— 同一套分格在不同图片上要各写各的。
+        # 连主体名都没写的空槽不进模板：套用时它也补不出什么名堂。
+        clean = [{"k": s["k"], "v": ""} for s in clean_segs(segs) if s.get("k")]
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO seg_templates(name, segs, updated) VALUES (?,?,?)",
+                (name, json.dumps(clean, ensure_ascii=False), time.time()),
+            )
+            self._db.commit()
+        return {"name": name, "segs": clean}
+
+    def delete_template(self, name: str):
+        with self._lock:
+            self._db.execute("DELETE FROM seg_templates WHERE name = ?", (name,))
             self._db.commit()
 
     # ---------- 画板 ----------
@@ -162,6 +302,11 @@ class Store:
                 it[k] = round(float(it.get(k, dv)))
             except (TypeError, ValueError):
                 it[k] = dv
+        # 固定（锁定位置与大小）：只留 True，其余一律清掉，避免脏数据
+        if it.get("pin"):
+            it["pin"] = True
+        else:
+            it.pop("pin", None)
         return it
 
     @staticmethod
@@ -179,6 +324,9 @@ class Store:
         }
         if not str(e.get("id") or "").strip():
             e["id"] = "e" + uuid.uuid4().hex[:10]
+        # 走线方式：贝塞尔曲线 / 90° 直角 / 45° 折角 / 直线
+        if e.get("route") not in {"curve", "ortho", "diag", "line"}:
+            e.pop("route", None)
         return e
 
     def board(self, board_id: int) -> dict:

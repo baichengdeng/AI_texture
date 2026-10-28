@@ -22,8 +22,10 @@ const state = {
   folders: [],            // 文件夹树
   rootPaths: new Set(),
   collapsed: readCollapsed(),
-  filter: { q: "", source: "", model: "", sampler: "", ratio: "", sort: "time-desc",
-            tag: "", fav: false, root: "", dir: "" },
+  facets: { total: 0, fav: 0, comfyui: 0, webui: 0, none: 0 },
+  filter: { q: "", family: "", sort: "time-desc",
+            tag: "", tags: [], fav: false, root: "", dir: "",
+            subfolders: localStorage.getItem("texture.gallerySubfolders") !== "0" },
 };
 
 const metaCache = new Map();
@@ -59,7 +61,7 @@ function toast(msg) {
 
 const filterActive = () => {
   const f = state.filter;
-  return !!(f.q || f.source || f.model || f.sampler || f.ratio || f.tag || f.fav || f.root || f.dir);
+  return !!(f.q || f.family || f.tag || (f.tags && f.tags.length) || f.fav || f.root || f.dir);
 };
 
 async function copyText(text, btn) {
@@ -91,23 +93,42 @@ async function loadImages() {
   const f = state.filter;
   const qs = new URLSearchParams();
   if (f.q) qs.set("q", f.q);
-  if (f.source) qs.set("source", f.source);
-  if (f.model) qs.set("model", f.model);
-  if (f.sampler) qs.set("sampler", f.sampler);
-  if (f.ratio) qs.set("ratio", f.ratio);
+  if (f.family) qs.set("family", f.family);
   if (f.sort !== "time-desc") qs.set("sort", f.sort);
   if (f.tag) qs.set("tag", f.tag);
   if (f.fav) qs.set("fav", "true");
   if (f.root) qs.set("root", f.root);
   if (f.dir) qs.set("dir", f.dir);
+  if (!f.subfolders) qs.set("subfolders", "false");
+  if (f.tags && f.tags.length) qs.set("tags", f.tags.join(","));
   if (!$("#lightbox").hidden) closeLightbox();
   const data = await api("/api/images?" + qs);
   state.items = data.items;
-  $("#stat").textContent = `${String(data.total).padStart(3, "0")} 张`;
-  fillSelect("#f-model", "全部模型", data.models, f.model);
-  fillSelect("#f-sampler", "全部采样器", data.samplers, f.sampler);
   renderGrid();
   updateGridInfo();
+  renderLibList();
+  syncFolderActive();
+  renderPromptChips();
+  window.dispatchEvent(new CustomEvent("texture:gallery-updated", {
+    detail: { filter: { ...state.filter } },
+  }));
+}
+
+async function loadFacets() {
+  const qs = new URLSearchParams();
+  if (state.filter.dir) qs.set("dir", state.filter.dir);
+  if (!state.filter.subfolders) qs.set("subfolders", "false");
+  try {
+    state.facets = await api("/api/facets?" + qs);
+  } catch {
+    state.facets = {
+      total: state.items.length,
+      fav: state.items.filter((x) => x.fav).length,
+      comfyui: state.items.filter((x) => x.family === "comfyui").length,
+      webui: state.items.filter((x) => x.family === "webui").length,
+      none: state.items.filter((x) => x.family === "none").length,
+    };
+  }
   renderLibList();
 }
 
@@ -115,7 +136,9 @@ function updateGridInfo() {
   const f = state.filter;
   const bits = [];
   if (f.dir) bits.push(baseName(f.dir) || f.dir);
+  if (f.family) bits.push(f.family === "comfyui" ? "ComfyUI" : f.family === "webui" ? "WebUI" : "无数据");
   if (f.tag) bits.push("#" + f.tag);
+  if (f.tags && f.tags.length) bits.push(f.tags.map((t) => "#" + t).join(" "));
   if (f.fav) bits.push("收藏");
   if (f.q) bits.push(`“${f.q}”`);
   const total = state.items.length;
@@ -252,11 +275,11 @@ async function openCtxMenu(ev, it) {
   const add = (label, fn, cls = "") => {
     const d = document.createElement("div");
     d.className = "ctx-item " + cls;
-    d.textContent = label;
+    d.innerHTML = label;   // 允许标签里带 <i class="ic"> 图标
     d.onclick = () => { closeCtxMenu(); fn(); };
     menu.appendChild(d);
   };
-  add(single ? "★ 收藏 / 取消收藏" : `★ 批量收藏（${n} 张）`, single
+  add(single ? '<i class="ic" data-ic="star"></i> 收藏 / 取消收藏' : `<i class="ic" data-ic="star"></i> 批量收藏（${n} 张）`, single
     ? async () => {
         const it2 = state.items.find((x) => x.id === it.id);
         await api("/api/fav", { method: "POST", body: { id: it.id, value: !it2?.fav } });
@@ -265,7 +288,7 @@ async function openCtxMenu(ev, it) {
         loadTags();
       }
     : batchFav);
-  add(single ? "＋ 添加标签" : `＋ 批量标签（${n} 张）`, single
+  add(single ? '<i class="ic" data-ic="attach"></i> 添加标签' : `<i class="ic" data-ic="attach"></i> 批量标签（${n} 张）`, single
     ? () => { setInspector(true); $("#lb-tag-input").focus(); }
     : batchTag);
   if (single) {
@@ -273,15 +296,15 @@ async function openCtxMenu(ev, it) {
     add("复制负面提示词", async () => copyText(meta.negative || ""));
   }
   menu.insertAdjacentHTML("beforeend", '<div class="ctx-sep"></div>');
-  if (single) add("打开原图", () => window.open("/api/file/" + it.id, "_blank"));
-  add("在资源管理器中显示", () => fetch("/api/reveal/" + it.id).then(() => {}));
+  if (single) add('<i class="ic" data-ic="enter"></i> 打开原图', () => window.open("/api/file/" + it.id, "_blank"));
+  add('<i class="ic" data-ic="locate"></i> 在资源管理器中显示', () => fetch("/api/reveal/" + it.id).then(() => {}));
   if (single) add("复制文件路径", () => copyText(meta.file?.path || it.path));
   add("加入当前画板", async () => {
     const ok = await addSelectionToBoard();
     if (ok) toast(`已加入画板（${ok} 张）`);
   });
   menu.insertAdjacentHTML("beforeend", '<div class="ctx-sep"></div>');
-  add(single ? "🗑 移入回收站" : `🗑 批量移入回收站（${n} 张）`,
+  add(single ? '<i class="ic" data-ic="ashbin"></i> 移入回收站' : `<i class="ic" data-ic="ashbin"></i> 批量移入回收站（${n} 张）`,
     () => batchDelete([...state.selection]), "danger");
   menu.hidden = false;
   const mw = menu.offsetWidth, mh = menu.offsetHeight;
@@ -355,21 +378,24 @@ function layoutMasonry() {
 /* 图库与素材抽屉共用的格子工厂 */
 function createAssetCell(it, opts = {}) {
   const { onClick, onDblClick, onContextMenu, index, className = "" } = opts;
+  const familyLabel = it.family === "comfyui" ? "ComfyUI"
+    : it.family === "webui" ? "WebUI" : "无数据";
   const cell = document.createElement("div");
   cell.className = ("cell" + (it.fav ? " fav" : "") +
     (state.selection.has(it.id) ? " picked" : "") + (className ? " " + className : "")).trim();
   cell.dataset.id = it.id;
   cell.draggable = true;
   cell.tabIndex = 0;
-  cell.title = it.name + (it.prompt ? "\n" + it.prompt : "");
+  cell.title = `${it.name}\n${familyLabel}${it.tool ? " · " + it.tool : ""}` +
+    (it.prompt ? "\n" + it.prompt : "");
   cell.setAttribute("role", "button");
   cell.setAttribute("aria-label",
     `${it.name}${index != null ? "，第 " + (index + 1) + " 张" : ""}` +
-    `${it.fav ? "，已收藏" : ""}${it.source && it.source !== "none" ? "，" + (SOURCE_LABEL[it.source] || it.source) : ""}`);
+    `${it.fav ? "，已收藏" : ""}，${familyLabel}`);
   if (index != null) cell.dataset.idx = index;
   cell.innerHTML = `
     <img data-src="/api/thumb/${it.id}?s=256" alt="" loading="lazy" decoding="async" draggable="false">
-    <span class="badge src-${it.source}">${SOURCE_LABEL[it.source] || it.source}</span>
+    <span class="badge src-${it.family || it.source}">${familyLabel}</span>
     <span class="star">★</span>
     ${index != null ? `<span class="no">${String(index + 1).padStart(3, "0")}</span>` : ""}
     <span class="tags">${(it.tags || []).slice(0, 3).map((t) => `<span>${esc(t)}</span>`).join("")}</span>`;
@@ -444,20 +470,23 @@ async function loadFolders() {
   } catch { roots = []; }
   state.folders = roots;
   state.rootPaths = new Set(roots.map((r) => r.path));
-  renderLibList();
+  await loadFacets();
   renderFolderTree();
 }
 
 function renderLibList() {
   const ul = $("#lib-list");
-  const total = state.items.length;
-  const favCount = state.items.filter((x) => x.fav).length;
-  const noneCount = state.items.filter((x) => x.source === "none").length;
+  const counts = state.facets || {};
   const rows = [
-    { key: "all", label: "全部图片", icon: "▦", n: total,
-      active: !state.filter.dir && !state.filter.fav && !state.filter.source },
-    { key: "fav", label: "收藏", icon: "★", n: favCount, active: state.filter.fav },
-    { key: "none", label: "无元数据", icon: "∅", n: noneCount, active: state.filter.source === "none" },
+    { key: "all", label: "全部图片", icon: "▦", n: counts.total || 0,
+      active: !state.filter.dir && !state.filter.fav && !state.filter.family && !state.filter.tag },
+    { key: "fav", label: "收藏", icon: "★", n: counts.fav || 0, active: state.filter.fav },
+    { key: "comfyui", label: "ComfyUI", icon: "◇", n: counts.comfyui || 0,
+      active: state.filter.family === "comfyui" },
+    { key: "webui", label: "WebUI", icon: "◎", n: counts.webui || 0,
+      active: state.filter.family === "webui" },
+    { key: "none", label: "无数据", icon: "∅", n: counts.none || 0,
+      active: state.filter.family === "none" },
   ];
   ul.innerHTML = "";
   for (const r of rows) {
@@ -465,21 +494,28 @@ function renderLibList() {
     li.className = "nav-row" + (r.active ? " active" : "");
     li.innerHTML = `<span class="ico">${r.icon}</span><span class="label">${r.label}</span>` +
       `<span class="cnt">${r.n}</span>`;
-    li.addEventListener("click", () => {
+    li.addEventListener("click", async () => {
       if (r.key === "all") {
-        state.filter.dir = ""; state.filter.fav = false; state.filter.source = "";
-        $("#f-fav").checked = false; $("#f-source").value = "";
+        state.filter.dir = "";
+        state.filter.fav = false;
+        state.filter.family = "";
+        state.filter.tag = "";
       } else if (r.key === "fav") {
-        if (state.filter.fav) { state.filter.fav = false; $("#f-fav").checked = false; }
-        else { state.filter.fav = true; $("#f-fav").checked = true; state.filter.dir = ""; }
+        state.filter.fav = !state.filter.fav;
+        state.filter.dir = "";
+        state.filter.family = "";
       } else {
-        state.filter.source = state.filter.source === "none" ? "" : "none";
-        $("#f-source").value = state.filter.source;
+        state.filter.family = state.filter.family === r.key ? "" : r.key;
+        state.filter.dir = "";
+        state.filter.fav = false;
       }
-      loadImages(); loadFolders();
+      await Promise.all([loadImages(), loadFacets()]);
+      if (!navPinned()) setNav(false);
     });
     ul.appendChild(li);
   }
+  const favToggle = $("#f-fav");
+  if (favToggle) favToggle.checked = state.filter.fav;
 }
 
 function renderFolderTree() {
@@ -488,6 +524,24 @@ function renderFolderTree() {
   if (!state.folders.length) {
     host.innerHTML = '<li class="nav-row empty">未添加文件夹</li>';
     return;
+  }
+  // 当前选中的目录如果在折叠的父级里，自动展开父级，否则看不到高亮
+  if (state.filter.dir) {
+    let changed = false;
+    for (const root of state.folders) {
+      if (!root.children) continue;
+      for (const kid of root.children) {
+        if (state.filter.dir === kid.path || state.filter.dir.startsWith(kid.path + "\\") ||
+            state.filter.dir.startsWith(kid.path + "/")) {
+          if (state.collapsed.delete(root.path)) changed = true;
+        }
+      }
+    }
+    if (changed) {
+      try {
+        localStorage.setItem("texture.foldersCollapsed", JSON.stringify([...state.collapsed]));
+      } catch { /* ignore */ }
+    }
   }
   const build = (nodes, parent) => {
     for (const node of nodes) {
@@ -499,14 +553,16 @@ function renderFolderTree() {
       const row = document.createElement("div");
       row.className = "nav-row tree-row" + (state.filter.dir === node.path ? " active" : "");
       row.title = node.path;
+      const isRoot = state.rootPaths.has(node.path);
       row.innerHTML = `
-        <button class="twisty${hasKids ? "" : " leaf"}" tabindex="-1">▸</button>
-        <span class="ico">${state.rootPaths.has(node.path) ? "◉" : "▸"}</span>
+        <button class="twisty${hasKids ? "" : " leaf"}" tabindex="-1" aria-label="${hasKids ? "展开或折叠" : ""}">▸</button>
         <span class="label">${esc(node.name || node.path)}</span>
         <span class="cnt">${node.total}</span>`;
+      row.setAttribute("aria-expanded", hasKids ? String(!state.collapsed.has(node.path)) : "");
       row.addEventListener("click", () => {
         state.filter.dir = state.filter.dir === node.path ? "" : node.path;
-        loadImages(); loadFolders();
+        syncFolderActive();
+        loadImages().then(loadFacets);
         if (!navPinned()) setNav(false);
       });
       const twisty = row.querySelector(".twisty");
@@ -516,14 +572,15 @@ function renderFolderTree() {
         li.classList.toggle("collapsed");
         if (li.classList.contains("collapsed")) state.collapsed.add(node.path);
         else state.collapsed.delete(node.path);
+        row.setAttribute("aria-expanded", String(!li.classList.contains("collapsed")));
         try {
           localStorage.setItem("texture.foldersCollapsed", JSON.stringify([...state.collapsed]));
         } catch { /* ignore */ }
       });
-      if (state.rootPaths.has(node.path)) {
+      if (isRoot) {
         const rm = document.createElement("span");
         rm.className = "rm";
-        rm.textContent = "✕";
+        rm.innerHTML = '<i class="ic" data-ic="close"></i>';
         rm.title = "从图库移除（不删文件）";
         rm.addEventListener("click", async (ev) => {
           ev.stopPropagation();
@@ -547,10 +604,48 @@ function renderFolderTree() {
   build(state.folders, host);
 }
 
+/* 只切高亮，不重建整棵树：避免点一下文件夹就闪一次 */
+function syncFolderActive() {
+  document.querySelectorAll("#folder-tree .tree-row").forEach((row) => {
+    row.classList.toggle("active", row.parentElement?.dataset.path === state.filter.dir);
+  });
+}
+
+/* 标签排序：名称 / 数量（记忆）；右键标签 → 重命名 / 删除 */
+let tagSortMode = localStorage.getItem("texture.tagSort") || "name-asc";
+
 async function loadTags() {
   const { tags } = await api("/api/tags");
   const ul = $("#tag-list");
-  const names = Object.keys(tags);
+  const inner = document.querySelector("#sec-tags .sec-inner");
+  // 排序下拉单独占一行挂在列表上方（不进分组标题，避免把标题挤断行）
+  if (inner && !inner.querySelector("#tag-sort")) {
+    const wrap = document.createElement("div");
+    wrap.className = "sec-tools";
+    const sel = document.createElement("select");
+    sel.id = "tag-sort";
+    sel.title = "标签排序";
+    sel.innerHTML = `
+      <option value="name-asc">名称 A→Z</option>
+      <option value="name-desc">名称 Z→A</option>
+      <option value="count-desc">数量 多→少</option>
+      <option value="count-asc">数量 少→多</option>`;
+    sel.value = tagSortMode;
+    sel.addEventListener("change", () => {
+      tagSortMode = sel.value;
+      localStorage.setItem("texture.tagSort", tagSortMode);
+      loadTags();
+    });
+    wrap.appendChild(sel);
+    inner.insertBefore(wrap, ul);
+  }
+  let names = Object.keys(tags);
+  const byName = (a, b) => a.localeCompare(b, "zh");
+  const byCount = (a, b) => (tags[b] - tags[a]) || byName(a, b);
+  if (tagSortMode === "name-asc") names.sort(byName);
+  else if (tagSortMode === "name-desc") names.sort((a, b) => byName(b, a));
+  else if (tagSortMode === "count-desc") names.sort(byCount);
+  else names.sort((a, b) => -byCount(a, b));
   ul.innerHTML = names.length ? "" : '<li class="nav-row empty">暂无标签</li>';
   names.forEach((n) => {
     const li = document.createElement("li");
@@ -562,8 +657,57 @@ async function loadTags() {
       loadImages(); loadTags();
       if (!navPinned()) setNav(false);
     });
+    li.addEventListener("contextmenu", (ev) => {
+      ev.preventDefault();
+      openTagMenu(ev, n);
+    });
     ul.appendChild(li);
   });
+}
+
+/* 标签右键菜单：重命名（全部图片同步） / 删除（全部图片同步移除） */
+function openTagMenu(ev, name) {
+  const menu = $("#ctx-menu");
+  menu.innerHTML = "";
+  const add = (label, fn, cls = "") => {
+    const d = document.createElement("div");
+    d.className = "ctx-item " + cls;
+    d.textContent = label;
+    d.onclick = async () => {
+      closeCtxMenu();
+      await fn();
+    };
+    menu.appendChild(d);
+  };
+  add('<i class="ic" data-ic="edit"></i> 重命名标签', async () => {
+    const newName = (await appPrompt(`重命名标签「${name}」
+（所有图片同步修改）：`, name)) || "";
+    if (!newName.trim() || newName.trim() === name) return;
+    try {
+      await api("/api/tags/rename", { method: "POST", body: { old: name, new: newName.trim() } });
+      toast(`已重命名为「${newName.trim()}」`);
+    } catch (e) {
+      toast("重命名失败：" + String(e.message || e).slice(0, 60));
+    }
+    if (state.filter.tag === name) state.filter.tag = newName.trim();
+    loadTags(); loadImages();
+  });
+  add('<i class="ic" data-ic="ashbin"></i> 删除标签', async () => {
+    if (!(await appConfirm(`删除标签「${name}」？
+（所有图片上的这个标签都会移除，图片文件不受影响）`))) return;
+    try {
+      await api("/api/tags?name=" + encodeURIComponent(name), { method: "DELETE" });
+      toast("标签已删除");
+    } catch (e) {
+      toast("删除失败：" + String(e.message || e).slice(0, 60));
+    }
+    if (state.filter.tag === name) state.filter.tag = "";
+    loadTags(); loadImages();
+  }, "danger");
+  menu.hidden = false;
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  menu.style.left = Math.min(ev.clientX, innerWidth - mw - 8) + "px";
+  menu.style.top = Math.min(ev.clientY, innerHeight - mh - 8) + "px";
 }
 
 async function loadSidebar() {
@@ -573,24 +717,148 @@ async function loadSidebar() {
 /* ---------------- 信息栏与灯箱 ---------------- */
 
 let currentMeta = null;
+let boardNodeEdit = null;
+
+const BOARD_NODE_KIND = {
+  text: "文本节点", md: "Markdown 文件", group: "分组",
+  link: "链接卡片", comfy: "ComfyUI 节点",
+};
+
+function boardNodeTitle(node) {
+  if (node.type === "group") return node.label || "分组";
+  if (node.type === "link") return node.url || "链接卡片";
+  if (node.type === "comfy") return node.title || node.cls || "ComfyUI 节点";
+  const first = String(node.text || "").split("\n").find((s) => s.trim()) || "";
+  return first.replace(/^#{1,6}\s*/, "").slice(0, 60) ||
+    (node.type === "md" ? "未命名 Markdown" : "文本节点");
+}
+
+/* 信息栏标题：既是显示，也是改名入口。
+   editable=true 时可直接编辑（仅图片）；画布节点、空态都只读。 */
+function setInspName(text, opts = {}) {
+  const el = $("#lb-name");
+  if (!el) return;
+  el.value = text || "";
+  el.readOnly = !opts.editable;
+  el.title = opts.title || (opts.editable ? "点击可重命名" : "");
+  el.dataset.base = text || "";
+}
+
+function hideBoardNodeEditor() {
+  boardNodeEdit = null;
+  const panel = $("#insp-board-node");
+  if (panel) panel.hidden = true;
+}
+
+/* 画布节点 → 右侧介绍栏。文字 / Markdown / 组直接在介绍栏编辑，
+   图片仍复用图库详情，因此参数、标签、导出能力完全一致。 */
+function showBoardNodeInspector(node, opts = {}) {
+  hideBoardNodeEditor();
+  boardNodeEdit = { id: node.id, opts };
+  state.selected = null;
+  currentMeta = null;
+  $("#insp-empty").hidden = true;
+  $("#insp-body").hidden = true;
+  $("#insp-thumb").removeAttribute("src");
+  $("#insp-thumb").parentElement.classList.remove("has-img");
+
+  setInspName(boardNodeTitle(node), { title: BOARD_NODE_KIND[node.type] || "画布节点" });
+  const kind = $("#insp-node-kind");
+  kind.textContent = BOARD_NODE_KIND[node.type] || "画布节点";
+  $("#insp-node-size").textContent =
+    `${Math.round(node.w)} × ${Math.round(node.h)}`;
+  const label = $("#insp-node-label");
+  const text = $("#insp-node-text");
+  const hint = $("#insp-node-hint");
+  const isComfy = node.type === "comfy";
+  label.textContent = node.type === "group" ? "组名称"
+    : node.type === "link" ? "链接地址"
+    : node.type === "md" ? "Markdown 内容"
+    : isComfy ? "节点参数（只读）" : "文本内容";
+  text.readOnly = isComfy;
+  text.value = node.type === "group" ? (node.label || "")
+    : node.type === "link" ? (node.url || "")
+    : isComfy
+      ? [node.title || node.cls, ...(node.widgets || []).map((w) => `${w.k}: ${w.v}`)].join("\n")
+      : (node.text || "");
+  hint.textContent = isComfy
+    ? "ComfyUI 节点由节点图导入，参数只读；可在画布上移动或删除。"
+    : "修改会实时同步到画布，并自动保存。";
+  panelShow("#insp-board-node");
+  setInspector(true);
+  if (opts.focus) setTimeout(() => text.focus(), 30);
+}
+
+function panelShow(sel) {
+  $(sel).hidden = false;
+}
+
+function onBoardNodeInput(value) {
+  if (!boardNodeEdit) return;
+  boardNodeEdit.opts.onChange?.(value);
+}
+
+window.showBoardNodeInspector = showBoardNodeInspector;
+window.hideBoardNodeInspector = hideBoardNodeEditor;
+window.setInspectorName = setInspName;
 
 const inspPinned = () => localStorage.getItem("texture.inspPin") !== "0";
 
+/* 图钉不再是单独的按钮：固定状态直接挂在「信息栏」开关上（默认展开即固定）。
+   Alt / Shift 点击开关 = 只切固定，不动开合。 */
 function refreshInspPin() {
-  const btn = $("#insp-pin");
-  btn.classList.toggle("on", inspPinned());
-  btn.textContent = inspPinned() ? "已固定" : "固定";
+  const btn = $("#insp-toggle");
+  if (!btn) return;
+  const open = $("#main").classList.contains("insp-open");
+  const on = open && inspPinned();
+  btn.classList.toggle("pinned", on);
+  btn.setAttribute("aria-pressed", String(on));
+  btn.title = !open ? "展开信息栏 (I)"
+    : on ? "信息栏已固定：放大看图时不收起（Alt+点击可取消固定）"
+    : "信息栏未固定：放大看图会自动收起（Alt+点击改回固定）";
 }
 
-function setInspector(open, save = true) {
+function setInspector(open, save = true, autoPin = true) {
   $("#main").classList.toggle("insp-open", open);
-  $("#insp-toggle").textContent = open ? "›" : "‹";
+  const btn = $("#insp-toggle");
+  if (btn) {
+    btn.classList.toggle("on", open);
+    btn.setAttribute("aria-expanded", String(open));
+  }
+  // 默认打开即固定
+  if (open && autoPin) localStorage.setItem("texture.inspPin", "1");
   if (save) localStorage.setItem("texture.insp", open ? "1" : "0");
+  refreshInspPin();
 }
 
 const inspSavedOpen = () => localStorage.getItem("texture.insp") !== "0";
 
+/* 从画板回到图库时，把信息栏恢复成图库语义：
+   有选中图片就显示详情，没有就回到空态提示。 */
+function restoreGalleryInspector() {
+  const node = $("#insp-board-node");
+  if (node) node.hidden = true;
+  if (state.selected) {
+    const cached = metaCache.get(state.selected);
+    if (cached) { currentMeta = cached; fillInspector(cached); return; }
+    api("/api/meta/" + state.selected)
+      .then((meta) => {
+        if (state.selected) { metaCache.set(state.selected, meta); currentMeta = meta; fillInspector(meta); }
+      })
+      .catch(() => {});
+    return;
+  }
+  currentMeta = null;
+  setInspName("未选择图片");
+  $("#insp-thumb").removeAttribute("src");
+  $("#insp-thumb").parentElement.classList.remove("has-img");
+  $("#insp-body").hidden = true;
+  $("#insp-empty").hidden = false;
+}
+
 async function selectImage(id) {
+  hideBoardNodeEditor();
+  if (tagSaveTimer) await flushTagDoc();   // 切图前先把没落盘的胶囊存了
   state.selected = id;
   const idx = state.items.findIndex((x) => x.id === id);
   if (idx >= 0) state.idx = idx;
@@ -616,8 +884,7 @@ function fillInspector(meta) {
   const body = $("#insp-body");
   body.hidden = false;
   body.classList.remove("swap"); void body.offsetWidth; body.classList.add("swap");
-  $("#lb-name").textContent = meta.file.name;
-  $("#lb-name").title = meta.file.path;
+  setInspName(meta.file.name, { editable: true, title: meta.file.path });
   const thumb = $("#insp-thumb");
   thumb.src = `/api/thumb/${fid}?s=384`;
   thumb.parentElement.classList.add("has-img");
@@ -629,8 +896,12 @@ function fillInspector(meta) {
   favBtn.classList.toggle("on", meta.fav);
   renderTagChips(meta);
   loadGraphTab(meta, fid);
+  const src = meta.source || "none";
+  const family = src === "comfyui" ? "ComfyUI"
+    : src === "none" || src === "error" ? "无数据" : "WebUI";
   const rows = [
-    ["来源", meta.tool || meta.source],
+    ["来源", family + (src !== "comfyui" && src !== "none" && src !== "error"
+      ? " · " + (meta.tool || src) : "")],
     ["模型", params.model], ["采样器", params.sampler],
     ["Seed", params.seed], ["步数", params.steps],
     ["CFG", params.cfg],
@@ -643,6 +914,15 @@ function fillInspector(meta) {
   $("#lb-setting").hidden = !meta.setting;
   $("#lb-pos").textContent = meta.prompt || "（无）";
   $("#lb-neg").textContent = meta.negative || "（无）";
+  // 没有提示词时只留胶囊；有就并列显示
+  const hasPos = !!String(meta.prompt || "").trim();
+  const hasNeg = !!String(meta.negative || "").trim();
+  const posSec = $("#pb-pos-sec");
+  const negSec = $("#pb-neg-sec");
+  if (posSec) posSec.hidden = !hasPos;
+  if (negSec) negSec.hidden = !hasNeg;
+  renderPromptChips();
+  loadTagDoc(meta);
   let raw = meta.raw || "";
   try {
     const obj = JSON.parse(raw);
@@ -691,6 +971,358 @@ function renderTagChips(meta) {
   }
 }
 
+/* ---------------- 提示词胶囊（词框） ---------------- */
+
+/* 提示词按逗号 / 换行切块。原文保留（用于精确检索），不做归一化改写。 */
+function splitPromptTags(text) {
+  return String(text || "")
+    .split(/[,，\n]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function qTerms() {
+  return String(state.filter.q || "")
+    .split(/[,，]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function setQTerms(terms) {
+  state.filter.q = terms.join(", ");
+  const box = $("#search");
+  if (box) box.value = state.filter.q;
+  const clear = $("#search-clear");
+  if (clear) clear.hidden = !state.filter.q;
+}
+
+/* 点胶囊 = 按这个 tag 找同款；Ctrl / Shift 点击 = 追加，多个 tag 之间是 AND */
+function togglePromptChip(raw, additive) {
+  const terms = qTerms();
+  const at = terms.indexOf(raw);
+  if (additive) {
+    if (at >= 0) terms.splice(at, 1);
+    else terms.push(raw);
+  } else if (terms.length === 1 && at === 0) {
+    terms.length = 0;
+  } else {
+    terms.splice(0, terms.length, raw);
+  }
+  setQTerms(terms);
+  renderPromptChips();
+  loadImages();
+}
+
+function renderPromptChips() {
+  const terms = qTerms();
+  const pick = (sel, rawText) => {
+    const host = $(sel);
+    if (!host) return 0;
+    const tags = splitPromptTags(rawText === "（无）" ? "" : rawText);
+    host.innerHTML = "";
+    for (const raw of tags) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = raw;
+      b.title = terms.includes(raw)
+        ? "取消按这个 tag 筛选"
+        : "按这个 tag 搜索（Ctrl / Shift 点击可多选，多个 tag 是「同时包含」）";
+      if (terms.includes(raw)) b.classList.add("on");
+      b.addEventListener("click", (ev) =>
+        togglePromptChip(raw, ev.ctrlKey || ev.metaKey || ev.shiftKey));
+      host.appendChild(b);
+    }
+    return tags.length;
+  };
+  const nPos = pick("#lb-pos-chips", $("#lb-pos")?.textContent || "");
+  const nNeg = pick("#lb-neg-chips", $("#lb-neg")?.textContent || "");
+  const pos = $("#pb-pos-n");
+  if (pos) pos.textContent = nPos ? `${nPos} 个` : "";
+  const neg = $("#pb-neg-n");
+  if (neg) neg.textContent = nNeg ? `${nNeg} 个` : "";
+}
+
+/* 提示词分区收起状态（默认展开，记忆在 localStorage） */
+function bindPromptSections() {
+  document.querySelectorAll(".pb-chev").forEach((btn) => {
+    const sec = btn.closest(".pb-sec");
+    btn.addEventListener("click", () => {
+      sec.classList.toggle("closed");
+      const open = !sec.classList.contains("closed");
+      btn.setAttribute("aria-expanded", String(open));
+      localStorage.setItem("texture.pb." + btn.dataset.sec, open ? "1" : "0");
+    });
+    if (localStorage.getItem("texture.pb." + btn.dataset.sec) === "0") {
+      sec.classList.add("closed");
+      btn.setAttribute("aria-expanded", "false");
+    }
+  });
+}
+
+/* 胶囊：一格 = 主体名 + 内容。展示态内容按逗号切词框（和提示词一致，点词框筛选），
+   点「编辑」切换纯文本编辑态；改动 500ms 防抖自动保存。 */
+const tagDoc = { fid: "", segs: [] };
+let tagSaveTimer = null;
+let tagTemplates = [];
+
+async function loadTagTemplates() {
+  try {
+    tagTemplates = (await api("/api/tagdoc/templates")).templates || [];
+  } catch { tagTemplates = []; }
+  const sel = $("#tag-template");
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">模板…</option>' + tagTemplates
+    .map((t) => `<option value="${esc(t.name)}">${esc(t.name)} · ${t.segs.length} 格</option>`)
+    .join("");
+  if (cur) sel.value = cur;
+}
+
+function renderTagSegs() {
+  const host = $("#tag-segs");
+  if (!host) return;
+  host.innerHTML = "";
+  tagDoc.segs.forEach((seg, i) => {
+    const box = document.createElement("article");
+    box.className = "tagseg";
+    box.innerHTML = `
+      <header>
+        <span class="tagseg-idx">${String(i + 1).padStart(2, "0")}</span>
+        <input class="tagseg-k" placeholder="主体名" title="这一格的主题：人物 / 服装 / 画风…" aria-label="胶囊主体">
+        <button class="tagseg-ico tagseg-edit" type="button" title="编辑内容（纯文本）"><i class="ic" data-ic="edit"></i></button>
+        <button class="tagseg-ico tagseg-x" type="button" title="删除这一格"><i class="ic" data-ic="ashbin"></i></button>
+      </header>
+      <div class="tagseg-chips"></div>
+      <textarea class="tagseg-v" hidden placeholder="这一格的内容，逗号分隔会切成词框" aria-label="胶囊内容"></textarea>`;
+    const kEl = box.querySelector(".tagseg-k");
+    const vEl = box.querySelector(".tagseg-v");
+    const chipsEl = box.querySelector(".tagseg-chips");
+    kEl.value = seg.k || "";
+    vEl.value = seg.v || "";
+
+    /* 展示态：内容切词框；点击 = 按这个词筛选（Ctrl/Shift = 多选 AND） */
+    const renderChips = () => {
+      chipsEl.innerHTML = "";
+      const tags = splitPromptTags(seg.v);
+      if (!tags.length) {
+        const ghost = document.createElement("button");
+        ghost.type = "button";
+        ghost.className = "tagseg-ghost";
+        ghost.textContent = "＋ 编辑内容";
+        ghost.addEventListener("click", () => editBtn.click());
+        chipsEl.appendChild(ghost);
+        return;
+      }
+      const terms = qTerms();
+      for (const raw of tags) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = raw;
+        b.title = terms.includes(raw)
+          ? "取消按这个词筛选"
+          : "按这个词筛选（Ctrl / Shift 点击可多选）";
+        if (terms.includes(raw)) b.classList.add("on");
+        b.addEventListener("click", (ev) =>
+          togglePromptChip(raw, ev.ctrlKey || ev.metaKey || ev.shiftKey));
+        chipsEl.appendChild(b);
+      }
+    };
+    renderChips();
+
+    /* 编辑态：纯文本，失焦或再点 ✎ 提交回词框 */
+    const editBtn = box.querySelector(".tagseg-edit");
+    const setEdit = (on) => {
+      vEl.hidden = !on;
+      chipsEl.hidden = on;
+      editBtn.classList.toggle("active", on);
+      editBtn.title = on ? "完成（回到词框）" : "编辑内容（纯文本）";
+      if (on) { vEl.focus(); }
+      else { seg.v = vEl.value; tagTouch(); renderChips(); }
+    };
+    editBtn.addEventListener("click", () => setEdit(vEl.hidden));
+    vEl.addEventListener("blur", () => setEdit(false));
+    vEl.addEventListener("keydown", (ev) => {
+      ev.stopPropagation();
+      if (ev.key === "Escape") vEl.blur();
+    });
+    kEl.addEventListener("input", () => { seg.k = kEl.value; tagTouch(); });
+    kEl.addEventListener("keydown", (ev) => {
+      ev.stopPropagation();
+      // 回车 = 再来一格，连续录入不用去点按钮
+      if (ev.key === "Enter") { ev.preventDefault(); $("#tag-add-seg")?.click(); }
+    });
+    box.querySelector(".tagseg-x").addEventListener("click", () => {
+      tagDoc.segs.splice(i, 1);
+      renderTagSegs();
+      tagTouch();
+    });
+    host.appendChild(box);
+  });
+  const empty = $("#tag-empty");
+  if (empty) empty.hidden = tagDoc.segs.length > 0;
+  const n = $("#tag-seg-n");
+  if (n) n.textContent = tagDoc.segs.length ? `${tagDoc.segs.length} 格` : "";
+}
+
+function loadTagDoc(meta) {
+  clearTimeout(tagSaveTimer);
+  tagSaveTimer = null;
+  tagDoc.fid = meta?.id || state.selected || "";
+  tagDoc.segs = (meta?.tagdoc || []).map((s) => ({ k: s.k || "", v: s.v || "" }));
+  renderTagSegs();
+}
+
+function tagTouch() {
+  clearTimeout(tagSaveTimer);
+  tagSaveTimer = setTimeout(() => { flushTagDoc(); }, 500);
+}
+
+async function flushTagDoc() {
+  clearTimeout(tagSaveTimer);
+  tagSaveTimer = null;
+  if (!tagDoc.fid) return;
+  const fid = tagDoc.fid;
+  // 记住发出去的值：回填时只在本地没再被改过的情况下才写，
+  // 否则请求飞行途中用户新敲的字会被旧响应盖回去。
+  const sent = tagDoc.segs.map((s) => ({ k: s.k, v: s.v }));
+  try {
+    const r = await api("/api/tagdoc/" + encodeURIComponent(fid), {
+      method: "PUT",
+      body: { segs: tagDoc.segs },
+    });
+    if (tagDoc.fid === fid && r.segs.length === tagDoc.segs.length) {
+      // 只回填字段值，不替换对象本身：
+      // 页面上的输入框都闭包引用着 tagDoc.segs 里的这些对象，
+      // 换掉对象会让正在编辑的那一格「失联」——新增一格时旧内容就会消失。
+      r.segs.forEach((s, i) => {
+        const cur = tagDoc.segs[i];
+        if (!cur) return;
+        if (cur.k === sent[i].k) cur.k = s.k;
+        if (cur.v === sent[i].v) cur.v = s.v;
+      });
+    }
+    const m = metaCache.get(fid);
+    if (m) m.tagdoc = tagDoc.segs.map((s) => ({ k: s.k, v: s.v }));
+  } catch (e) {
+    toast("胶囊保存失败：" + String(e.message || e).slice(0, 60));
+  }
+}
+
+/* ---------------- 选图弹窗：把胶囊模板套到别的图片上 ---------------- */
+
+function pickImageTargets() {
+  return new Promise((resolve) => {
+    const root = document.createElement("div");
+    root.id = "app-pick";
+    const chosen = new Set();
+    let list = state.items || [];
+    const close = (val) => {
+      root.classList.add("closing");
+      setTimeout(() => root.remove(), 120);
+      resolve(val);
+    };
+    root.innerHTML = `
+      <div class="ap-mask"></div>
+      <div class="am-box ap-box">
+        <p class="am-eyebrow">Pick Images</p>
+        <p class="ap-title">挑几张图，把这个胶囊模板套上去</p>
+        <input class="ap-search" type="search" placeholder="按文件名 / 标签 / 提示词搜索…" autocomplete="off">
+        <div class="ap-grid"></div>
+        <p class="ap-empty" hidden>没有匹配的图片</p>
+        <div class="ap-foot">
+          <span class="ap-count">已选 0 张</span>
+          <div class="am-btns">
+            <button class="ap-cancel" type="button">取消</button>
+            <button class="am-ok" type="button">套用</button>
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(root);
+
+    const grid = root.querySelector(".ap-grid");
+    const count = root.querySelector(".ap-count");
+    const emptyEl = root.querySelector(".ap-empty");
+    const okBtn = root.querySelector(".am-ok");
+
+    const paint = () => {
+      grid.innerHTML = "";
+      emptyEl.hidden = list.length > 0;
+      const frag = document.createDocumentFragment();
+      for (const it of list) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "ap-cell" + (chosen.has(it.id) ? " on" : "");
+        b.title = it.name;
+        b.innerHTML = `<img loading="lazy" decoding="async" src="/api/thumb/${it.id}?s=128" alt="">
+          <span class="ap-cap"></span>`;
+        b.querySelector(".ap-cap").textContent = it.name;
+        b.onclick = () => {
+          if (chosen.has(it.id)) chosen.delete(it.id); else chosen.add(it.id);
+          b.classList.toggle("on", chosen.has(it.id));
+          count.textContent = `已选 ${chosen.size} 张`;
+          okBtn.disabled = !chosen.size;
+        };
+        frag.appendChild(b);
+      }
+      grid.appendChild(frag);
+    };
+
+    const search = root.querySelector(".ap-search");
+    let st = null;
+    search.addEventListener("input", () => {
+      clearTimeout(st);
+      const q = search.value.trim();
+      st = setTimeout(async () => {
+        if (!q) { list = state.items || []; paint(); return; }
+        try {
+          const data = await api("/api/images?q=" + encodeURIComponent(q));
+          list = data.items || [];
+          paint();
+        } catch { /* 搜索失败就保持原列表 */ }
+      }, 220);
+    });
+
+    okBtn.disabled = true;
+    paint();
+    root.querySelector(".ap-cancel").onclick = () => close([]);
+    okBtn.onclick = () => close([...chosen]);
+    root.querySelector(".ap-mask").onclick = () => close([]);
+    root.onkeydown = (e) => { if (e.key === "Escape") close([]); };
+    search.focus();
+  });
+}
+
+/* 把一份模板套到若干张图上（只补分格名，内容各图自己写） */
+async function applyTemplateTo(ids, name) {
+  if (!name) { toast("先选一个模板"); return; }
+  if (!ids.length) { toast("还没有选中图片"); return; }
+  try {
+    await flushTagDoc();     // 先把手上没存完的编辑落盘，别被模板盖掉
+    const r = await api("/api/tagdoc/apply",
+      { method: "POST", body: { ids, template: name, mode: "merge" } });
+    for (const fid of ids) {
+      const m = metaCache.get(fid);
+      if (m && r.docs[fid]) m.tagdoc = r.docs[fid];
+    }
+    if (state.selected && r.docs[state.selected]) {
+      const server = r.docs[state.selected];
+      if (server.length === tagDoc.segs.length) {
+        // 数量一致就原地改字段，别换对象（换对象会让正在编辑的那格失联）
+        server.forEach((s, i) => {
+          tagDoc.segs[i].k = s.k || "";
+          tagDoc.segs[i].v = s.v || "";
+        });
+      } else {
+        tagDoc.segs = server.map((s) => ({ k: s.k || "", v: s.v || "" }));
+      }
+      renderTagSegs();
+    }
+    toast(`已给 ${ids.length} 张图片套上「${name}」的胶囊`);
+  } catch (e) {
+    toast("应用失败：" + String(e.message || e).slice(0, 60));
+  }
+}
+
 /* ---------------- 节点图（ComfyUI） ---------------- */
 
 const graphCache = new Map();
@@ -715,11 +1347,23 @@ function showTab(name) {
   document.querySelectorAll(".tab-body").forEach((b) => (b.hidden = true));
   const el = $("#tab-" + name);
   if (el) el.hidden = false;
-  if (name === "graph" && graphShown) {
-    // 页签从隐藏变为可见后才能量到宽度，这里重算一次比例
-    $("#graph-view").innerHTML = graphSVG(graphShown);
-    bindGraphPreview($("#graph-view"));
+  if (name === "graph") {
+    if (graphShown) {
+      // 页签从隐藏变为可见后才能量到宽度，这里重算一次比例
+      $("#graph-view").innerHTML = graphSVG(graphShown);
+      bindGraphPreview($("#graph-view"));
+    } else {
+      // 没有节点图时也要给人一句话，避免一整片空白
+      const empty = $("#graph-empty");
+      if (!empty.textContent.trim()) {
+        empty.textContent = state.selected
+          ? "这张图没有可用的节点图 —— 节点图只对 ComfyUI 生成的图片有效。"
+          : "选中一张图片后，这里显示它的 ComfyUI 节点图。";
+      }
+      empty.hidden = false;
+    }
   }
+  if (name === "prompt") loadTagTemplates();
 }
 
 async function renderGraph(fid) {
@@ -928,17 +1572,27 @@ function stepLightbox(dir) {
 
 /* ---------------- 抽屉导航 ---------------- */
 
-function setNav(open, save = true) {
+function setNav(open, save = true, autoPin = true) {
   document.body.classList.toggle("nav-closed", !open);
   if (save) localStorage.setItem("texture.nav", open ? "1" : "0");
+  // 默认打开即固定：展开侧栏就等于把它钉住，不会再因为选文件夹自动收起
+  if (open && autoPin) localStorage.setItem("texture.navPin", "1");
+  refreshNavPin();
 }
 
-const navPinned = () => localStorage.getItem("texture.navPin") === "1";
+const navPinned = () => localStorage.getItem("texture.navPin") !== "0";
 
+/* 图钉并进「侧栏」开关本身：图标亮黄 = 已固定（默认） */
 function refreshNavPin() {
-  const btn = $("#nav-pin");
-  btn.classList.toggle("on", navPinned());
-  btn.textContent = navPinned() ? "已固定" : "固定";
+  const btn = $("#nav-toggle");
+  if (!btn) return;
+  const open = !document.body.classList.contains("nav-closed");
+  const on = open && navPinned();
+  btn.classList.toggle("pinned", on);
+  btn.setAttribute("aria-pressed", String(on));
+  btn.title = !open ? "打开侧栏 (N)"
+    : on ? "侧栏已固定：选文件夹不会自动收起（点一下收起，Alt+点击可取消固定）"
+    : "侧栏未固定：选文件夹后会自动收起（Alt+点击改回固定）";
 }
 
 function bindNav() {
@@ -947,12 +1601,14 @@ function bindNav() {
   const narrow = window.matchMedia("(max-width: 900px)").matches;
   const open = saved === null ? !narrow : saved !== "0";
   setNav(open, false);
-  refreshNavPin();
-  $("#nav-toggle").addEventListener("click", () =>
-    setNav(document.body.classList.contains("nav-closed")));
-  $("#nav-pin").addEventListener("click", () => {
-    localStorage.setItem("texture.navPin", navPinned() ? "0" : "1");
-    refreshNavPin();
+  $("#nav-toggle").addEventListener("click", (ev) => {
+    if (ev.altKey || ev.shiftKey) {          // Alt/Shift 点击 = 只切固定
+      localStorage.setItem("texture.navPin", navPinned() ? "0" : "1");
+      refreshNavPin();
+      toast(navPinned() ? "侧栏已固定" : "侧栏取消固定：选文件夹后自动收起");
+      return;
+    }
+    setNav(document.body.classList.contains("nav-closed"));
   });
 }
 
@@ -964,6 +1620,65 @@ async function addSelectionToBoard() {
     return 0;
   }
   return window.addImagesToBoard([...state.selection]);
+}
+
+/* ---------------- 左右面板拖拽调宽 ---------------- */
+
+function bindPanelResize() {
+  const root = document.documentElement;
+  const savedNav = Number(localStorage.getItem("texture.navWidth"));
+  const savedInsp = Number(localStorage.getItem("texture.inspWidth"));
+  if (savedNav >= 160) {
+    root.style.setProperty("--nav-w", Math.min(savedNav, Math.max(160, innerWidth * 0.4)) + "px");
+  }
+  if (savedInsp >= 240) {
+    root.style.setProperty("--insp-w", Math.min(savedInsp, Math.max(240, innerWidth * 0.52)) + "px");
+  }
+
+  const drag = (ev, kind) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    const startX = ev.clientX;
+    const start = kind === "nav"
+      ? $("#sidebar").getBoundingClientRect().width
+      : $("#inspector").getBoundingClientRect().width;
+    let raf = 0;
+    const apply = (width) => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        if (kind === "nav") {
+          root.style.setProperty("--nav-w", width + "px");
+          localStorage.setItem("texture.navWidth", String(Math.round(width)));
+        } else {
+          root.style.setProperty("--insp-w", width + "px");
+          localStorage.setItem("texture.inspWidth", String(Math.round(width)));
+        }
+        window.dispatchEvent(new Event("resize"));
+      });
+    };
+    document.body.classList.add("panel-resizing");
+    const onMove = (e) => {
+      const dx = e.clientX - startX;
+      if (kind === "nav") {
+        const max = Math.min(420, innerWidth * 0.4);
+        apply(Math.max(160, Math.min(max, start + dx)));
+      } else {
+        const max = Math.min(620, innerWidth * 0.52);
+        apply(Math.max(240, Math.min(max, start - dx)));
+      }
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.classList.remove("panel-resizing");
+      if (kind === "nav" && document.body.classList.contains("nav-closed")) setNav(true);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
+
+  $("#sidebar-resizer")?.addEventListener("mousedown", (ev) => drag(ev, "nav"));
+  $("#insp-resizer")?.addEventListener("mousedown", (ev) => drag(ev, "insp"));
 }
 
 /* ---------------- 事件绑定 ---------------- */
@@ -988,20 +1703,29 @@ function bindEvents() {
     search.focus();
   });
 
-  $("#f-source").addEventListener("change", (ev) => { state.filter.source = ev.target.value; loadImages(); });
-  $("#f-model").addEventListener("change", (ev) => { state.filter.model = ev.target.value; loadImages(); });
-  $("#f-sampler").addEventListener("change", (ev) => { state.filter.sampler = ev.target.value; loadImages(); });
-  $("#f-ratio").addEventListener("change", (ev) => { state.filter.ratio = ev.target.value; loadImages(); });
   $("#f-sort").addEventListener("change", (ev) => { state.filter.sort = ev.target.value; loadImages(); });
-  $("#f-fav").addEventListener("change", (ev) => { state.filter.fav = ev.target.checked; loadImages(); loadFolders(); });
+  const subBtn = $("#f-subfolders");
+  const syncSubBtn = () => {
+    subBtn.classList.toggle("active", state.filter.subfolders);
+    subBtn.setAttribute("aria-pressed", String(state.filter.subfolders));
+  };
+  syncSubBtn();
+  subBtn.addEventListener("click", () => {
+    state.filter.subfolders = !state.filter.subfolders;
+    localStorage.setItem("texture.gallerySubfolders", state.filter.subfolders ? "1" : "0");
+    syncSubBtn();
+    loadImages(); loadFacets();
+  });
+  $("#f-fav").addEventListener("change", (ev) => { state.filter.fav = ev.target.checked; loadImages(); loadFacets(); });
 
   $("#btn-clear-filter").addEventListener("click", () => {
-    state.filter = { q: "", source: "", model: "", sampler: "", ratio: "", sort: "time-desc",
-                     tag: "", fav: false, root: "", dir: "" };
+    state.filter = { q: "", family: "", sort: "time-desc",
+                     tag: "", tags: [], fav: false, root: "", dir: "",
+                     subfolders: state.filter.subfolders };
     search.value = "";
     clearBtn.hidden = true;
-    $("#f-source").value = ""; $("#f-model").value = ""; $("#f-sampler").value = "";
-    $("#f-ratio").value = ""; $("#f-fav").checked = false;
+    $("#f-fav").checked = false;
+    renderPromptChips();
     loadImages(); loadSidebar();
   });
 
@@ -1015,7 +1739,8 @@ function bindEvents() {
   });
 
   const rescan = async () => {
-    $("#stat").textContent = "扫描中…";
+    const stat = $("#stat");
+    if (stat) stat.textContent = "扫描中…";
     metaCache.clear();
     state.animateNext = true;
     await api("/api/rescan", { method: "POST" });
@@ -1039,11 +1764,71 @@ function bindEvents() {
   $("#lb-next").addEventListener("click", () => stepLightbox(1));
   setInspector(inspSavedOpen(), false);
   refreshInspPin();
-  $("#insp-toggle").addEventListener("click", () =>
-    setInspector(!$("#main").classList.contains("insp-open")));
-  $("#insp-pin").addEventListener("click", () => {
-    localStorage.setItem("texture.inspPin", inspPinned() ? "0" : "1");
-    refreshInspPin();
+  $("#insp-toggle").addEventListener("click", (ev) => {
+    if (ev.altKey || ev.shiftKey) {
+      localStorage.setItem("texture.inspPin", inspPinned() ? "0" : "1");
+      refreshInspPin();
+      toast(inspPinned() ? "信息栏已固定" : "信息栏取消固定：放大看图会自动收起");
+      return;
+    }
+    setInspector(!$("#main").classList.contains("insp-open"));
+  });
+  $("#insp-node-text").addEventListener("input", (ev) => onBoardNodeInput(ev.target.value));
+  $("#insp-node-dup").addEventListener("click", () => boardNodeEdit?.opts.onDuplicate?.());
+  $("#insp-node-del").addEventListener("click", () => boardNodeEdit?.opts.onDelete?.());
+
+  /* 标题即改名入口：回车提交，Esc 撤回，失焦也提交 */
+  const nameEl = $("#lb-name");
+  nameEl.addEventListener("focus", () => {
+    if (nameEl.readOnly) return;
+    const dot = nameEl.value.lastIndexOf(".");
+    const end = dot > 0 ? dot : nameEl.value.length;
+    requestAnimationFrame(() => {
+      try { nameEl.setSelectionRange(0, end); } catch { /* ignore */ }
+    });
+  });
+  nameEl.addEventListener("keydown", (ev) => {
+    if (nameEl.readOnly) return;
+    if (ev.key === "Enter") { ev.preventDefault(); nameEl.blur(); }
+    else if (ev.key === "Escape") {
+      ev.preventDefault();
+      nameEl.value = nameEl.dataset.base || "";
+      nameEl.blur();
+    }
+  });
+  nameEl.addEventListener("blur", async () => {
+    if (nameEl.readOnly) return;
+    const base = nameEl.dataset.base || "";
+    const next = nameEl.value.trim();
+    if (!next || next === base) { nameEl.value = base; return; }
+    const id = currentFileId();
+    if (!id) { nameEl.value = base; return; }
+    try {
+      const r = await api("/api/rename/" + encodeURIComponent(id),
+        { method: "POST", body: { name: next, path: currentMeta?.file?.path || "" } });
+      nameEl.value = r.name;
+      nameEl.dataset.base = r.name;
+      const it = state.items.find((x) => x.id === id);
+      if (it) {
+        it.name = r.name;
+        const cell = document.querySelector(`.cell[data-id="${id}"]`);
+        if (cell) { cell.title = r.name; cell.setAttribute("aria-label", r.name); }
+      }
+      const m = metaCache.get(id);
+      if (m && m.file) {
+        m.file.name = r.name;
+        m.file.path = m.file.path.replace(/[^\\/]+$/, r.name);
+      }
+      const info = $("#lb-fileinfo");
+      if (info && m?.file?.path) {
+        info.textContent = info.textContent.replace(/^.*?(?= · )/, m.file.path);
+        nameEl.title = m.file.path;
+      }
+      toast("已重命名为 " + r.name);
+    } catch (e) {
+      nameEl.value = base;
+      toast("重命名失败：" + String(e.message || e).slice(0, 80));
+    }
   });
   $("#lb-fav").addEventListener("click", async (ev) => {
     const id = currentFileId();
@@ -1076,6 +1861,60 @@ function bindEvents() {
   });
   document.querySelectorAll(".lb-tabs button").forEach((btn) => {
     btn.addEventListener("click", () => showTab(btn.dataset.tab));
+  });
+
+  /* 提示词分区 + 胶囊 */
+  bindPromptSections();
+  loadTagTemplates();
+  $("#tag-add-seg").addEventListener("click", () => {
+    tagDoc.segs.push({ k: "", v: "" });
+    renderTagSegs();
+    const boxes = document.querySelectorAll("#tag-segs .tagseg");
+    boxes[boxes.length - 1]?.scrollIntoView({ block: "nearest" });
+    const inputs = document.querySelectorAll("#tag-segs .tagseg-k");
+    inputs[inputs.length - 1]?.focus();
+    tagTouch();
+  });
+  $("#tag-apply").addEventListener("click", async () => {
+    const name = $("#tag-template").value;
+    if (!name) { toast("先在左边选一个模板"); return; }
+    const ids = state.selection.size ? [...state.selection]
+      : (state.selected ? [state.selected] : []);
+    if (!ids.length) { toast("还没有选中图片"); return; }
+    await applyTemplateTo(ids, name);
+  });
+  $("#tag-apply-to").addEventListener("click", async () => {
+    const name = $("#tag-template").value;
+    if (!name) { toast("先在左边选一个模板"); return; }
+    const ids = await pickImageTargets();
+    if (!ids.length) return;
+    await applyTemplateTo(ids, name);
+  });
+  $("#tag-save-tpl").addEventListener("click", async () => {
+    if (!tagDoc.segs.length) { toast("当前没有胶囊可存"); return; }
+    const dft = tagDoc.segs.find((s) => s.k)?.k || "我的胶囊";
+    const name = (await appPrompt("模板名称（只存分格名，不含内容）：", dft)) || "";
+    if (!name.trim()) return;
+    try {
+      await api("/api/tagdoc/templates", {
+        method: "POST",
+        body: { name: name.trim(), segs: tagDoc.segs },
+      });
+      await loadTagTemplates();
+      $("#tag-template").value = name.trim();
+      toast("已存为模板「" + name.trim() + "」（只记分格名）");
+    } catch (e) {
+      toast("保存模板失败：" + String(e.message || e).slice(0, 60));
+    }
+  });
+  $("#tag-del-tpl").addEventListener("click", async () => {
+    const name = $("#tag-template").value;
+    if (!name) { toast("先选中要删除的模板"); return; }
+    if (!(await appConfirm(`删除模板「${name}」？\n（只删模板，已写进图片的胶囊不受影响）`))) return;
+    await api("/api/tagdoc/templates?name=" + encodeURIComponent(name), { method: "DELETE" });
+    await loadTagTemplates();
+    $("#tag-template").value = "";
+    toast("已删除模板");
   });
   $("#graph-to-board").addEventListener("click", async () => {
     const fid = currentFileId();
@@ -1122,7 +1961,8 @@ function bindEvents() {
     applyTheme(next);
     toast(next === "light" ? "已切换到浅色主题" : "已切换到深色主题");
   });
-  $("#set-shortcuts").addEventListener("click", () => { $("#shortcuts").hidden = false; });
+  $("#hk-reset-all")?.addEventListener("click", () => Hotkeys.resetAll());
+  $("#set-shortcuts").addEventListener("click", () => { Hotkeys.renderPanel(); $("#shortcuts").hidden = false; });
 
   document.addEventListener("keydown", (ev) => {
     const inField = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName)
@@ -1143,15 +1983,15 @@ function bindEvents() {
     }
     if (ev.key === "ArrowLeft" && !inField) stepLightbox(-1);
     if (ev.key === "ArrowRight" && !inField) stepLightbox(1);
-    if (ev.key === "Enter" && !inField && state.selected) openLightbox(state.selected);
-    if ((ev.key === "a" || ev.key === "A") && (ev.ctrlKey || ev.metaKey) && !inField) {
+    if (!inField && Hotkeys.match(ev, "gallery.enter") && state.selected) openLightbox(state.selected);
+    if (!inField && Hotkeys.match(ev, "gallery.all")) {
       ev.preventDefault();
       state.selection = new Set(state.items.map((x) => x.id));
       document.querySelectorAll(".cell").forEach((c) => c.classList.add("picked"));
       syncSelectionBar();
     }
-    if (ev.key === "?" && !inField) $("#shortcuts").hidden = !$("#shortcuts").hidden;
-    if ((ev.key === "i" || ev.key === "I") && !inField) {
+    if (!inField && Hotkeys.match(ev, "gallery.panel")) { Hotkeys.renderPanel(); $("#shortcuts").hidden = !$("#shortcuts").hidden; }
+    if (!inField && Hotkeys.match(ev, "gallery.info")) {
       setInspector(!$("#main").classList.contains("insp-open"));
     }
     if (ev.key === "Escape") {
@@ -1164,7 +2004,7 @@ function bindEvents() {
       }
       setNav(false);
     }
-    if ((ev.key === "n" || ev.key === "N") && !inField && !ev.ctrlKey && !ev.altKey) {
+    if (!inField && Hotkeys.match(ev, "gallery.nav")) {
       setNav(document.body.classList.contains("nav-closed"));
     }
   });
@@ -1203,6 +2043,11 @@ function bindEvents() {
 let onSwitchToBoard = null;
 function switchView(view) {
   if (view !== "board" && typeof window.onLeaveBoard === "function") window.onLeaveBoard();
+  /* 离开画板时把信息栏还给图库：否则会残留画布节点编辑面板 */
+  if (view !== "board") {
+    window.hideBoardNodeInspector?.();
+    restoreGalleryInspector();
+  }
   document.querySelectorAll("#view-switch button").forEach((b) => {
     const on = b.dataset.view === view;
     b.classList.toggle("active", on);
@@ -1237,6 +2082,7 @@ function bindSectionCollapse() {
 /* ---------------- 启动 ---------------- */
 bindEvents();
 bindNav();
+bindPanelResize();
 bindLbZoom();
 bindSectionCollapse();
 loadImages();

@@ -100,7 +100,7 @@ def board_to_canvas(board: dict, items_by_id: dict, vault: str = "") -> dict:
     for it in board.get("items", []):
         pos = _radius(it)
         color = str(it.get("color") or "")
-        if it.get("type") == "text":
+        if it.get("type") in ("text", "md"):
             node = {"id": it["id"], "type": "text", "text": it.get("text", ""),
                     "x": pos["x"], "y": pos["y"], "width": pos["w"], "height": pos["h"]}
         elif it.get("type") == "comfy":
@@ -209,6 +209,10 @@ def board_to_html(board: dict, items_by_id: dict, out: Path, full: bool = False)
         if it.get("type") == "text":
             body = html.escape(it.get("text", "")).replace("\n", "<br>")
             parts.append(f'<div class="{cls.strip()} txt" style="{style}">{body}</div>')
+            continue
+        if it.get("type") == "md":
+            body = html.escape(it.get("text", ""))
+            parts.append(f'<div class="{cls.strip()} txt md" style="{style}">{body}</div>')
             continue
         if it.get("type") == "comfy":
             title = html.escape(str(it.get("title") or it.get("cls") or "Node"))

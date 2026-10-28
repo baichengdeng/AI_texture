@@ -22,7 +22,16 @@
     "4": "#44cf6e", "5": "#53dfdd", "6": "#a882ff",
   };
   const EDGE_STROKE = "#9a9aa2";
-  const MIN_W = 60, MIN_H = 40;
+  /* 连线走线方式：贝塞尔曲线 / 90° 直角 / 45° 折角 / 直接直线 */
+  const ROUTES = ["curve", "ortho", "diag", "line"];
+  const ROUTE_LABEL = { curve: "曲线", ortho: "90° 直角", diag: "45° 折角", line: "直线" };
+  const SIDE_DIR = {
+    top: { x: 0, y: -1 }, bottom: { x: 0, y: 1 },
+    left: { x: -1, y: 0 }, right: { x: 1, y: 0 },
+  };
+  const MIN_W = 24, MIN_H = 20;
+  // 缩放热区固定为 16 屏幕像素，是 2px 选中轮廓的 8 倍（要求至少 5 倍）。
+  const RESIZE_HIT_SCREEN = 16;
 
   const board = {
     id: null, name: "",
@@ -53,6 +62,8 @@
     it.id = String(it.id || uid());
     if (!it.type) it.type = "image";
     if (it.type === "image" && it.fileId == null) it.fileId = String(it.id);
+    if (it.type === "md") it.text = String(it.text || "");
+    if (it.type === "group") it.label = String(it.label || "分组");
     if (it.type === "comfy") {
       // ComfyUI 节点图的节点：标题、类型、参数列表
       it.title = String(it.title || it.cls || "Node");
@@ -76,12 +87,84 @@
     e.id = String(e.id || uid("e"));
     e.from = { node: String(e.from?.node || ""), side: SIDES.includes(e.from?.side) ? e.from.side : "right" };
     e.to = { node: String(e.to?.node || ""), side: SIDES.includes(e.to?.side) ? e.to.side : "left" };
+    e.route = ROUTES.includes(e.route) ? e.route : "curve";
     return e;
+  }
+
+  /* 轻量 Markdown：只支持标题、列表、引用、代码、粗体、斜体、行内代码和链接。
+     全部先转义再拼标签，不引入第三方库，也不会执行内嵌 HTML。 */
+  function mdToHTML(source) {
+    const lines = String(source || "").replace(/\r\n?/g, "\n").split("\n");
+    const out = [];
+    let inCode = false, code = [], list = false;
+    const inline = (s) => esc(s)
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+        '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+    const closeList = () => { if (list) { out.push("</ul>"); list = false; } };
+    for (const line of lines) {
+      if (/^```/.test(line)) {
+        if (inCode) { out.push(`<pre>${esc(code.join("\n"))}</pre>`); code = []; }
+        inCode = !inCode;
+        continue;
+      }
+      if (inCode) { code.push(line); continue; }
+      const h = line.match(/^(#{1,3})\s+(.*)$/);
+      if (h) { closeList(); out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`); continue; }
+      const li = line.match(/^\s*[-*]\s+(.*)$/);
+      if (li) {
+        if (!list) { out.push("<ul>"); list = true; }
+        out.push(`<li>${inline(li[1])}</li>`);
+        continue;
+      }
+      closeList();
+      const quote = line.match(/^>\s?(.*)$/);
+      if (quote) { out.push(`<blockquote>${inline(quote[1])}</blockquote>`); continue; }
+      if (!line.trim()) continue;
+      out.push(`<p>${inline(line)}</p>`);
+    }
+    closeList();
+    if (inCode) out.push(`<pre>${esc(code.join("\n"))}</pre>`);
+    return out.join("");
+  }
+
+  const FONT_FAMILY = {
+    sans: 'var(--font-text)',
+    serif: '"Songti SC", "SimSun", "Noto Serif SC", serif',
+    mono: 'var(--font-mono)',
+  };
+
+  function nodeTextTargets(el) {
+    return el.querySelectorAll(
+      ".b-text-body, .b-md-body, .b-group-label, .b-link, .b-comfy-body");
+  }
+
+  function applyNodeTextStyle(it, el) {
+    for (const target of nodeTextTargets(el)) {
+      target.style.color = it.textColor || "";
+      target.style.fontSize = it.fontSize ? it.fontSize + "px" : "";
+      target.style.textAlign = it.textAlign || "";
+      target.style.lineHeight = it.lineHeight || "";
+      target.style.fontFamily = it.fontFamily ? (FONT_FAMILY[it.fontFamily] || "") : "";
+    }
+  }
+
+  function nodeTitle(node) {
+    if (node.type === "group") return node.label || "分组";
+    if (node.type === "link") return node.url || "链接";
+    if (node.type === "comfy") return node.title || "ComfyUI 节点";
+    const first = String(node.text || "").split("\n").find((s) => s.trim()) || "";
+    return first.replace(/^#{1,6}\s*/, "").slice(0, 60) ||
+      (node.type === "md" ? "未命名 Markdown" : "文本节点");
   }
 
   /* ---------- 视口 ---------- */
   function applyTransform() {
     canvas.style.transform = `translate(${board.panX}px, ${board.panY}px) scale(${board.scale})`;
+    // 抵消画布缩放，让任意比例下的缩放热区都保持相同的屏幕宽度。
+    canvas.style.setProperty("--rz-hit", `${RESIZE_HIT_SCREEN / board.scale}px`);
     $("#zoom-level").textContent = Math.round(board.scale * 100) + "%";
     saveViewportSoon();
   }
@@ -182,10 +265,106 @@
     return { x: p.x, y: p.y + h };
   }
 
+  /* 折线的中点：按长度走到一半，标签就放在这里 */
+  function polyMid(pts) {
+    if (!pts.length) return { x: 0, y: 0 };
+    const segs = [];
+    let total = 0;
+    for (let i = 1; i < pts.length; i++) {
+      const l = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+      segs.push(l);
+      total += l;
+    }
+    if (total < 0.01) return pts[0];
+    let acc = 0;
+    for (let i = 0; i < segs.length; i++) {
+      if (acc + segs[i] >= total / 2) {
+        const t = segs[i] ? (total / 2 - acc) / segs[i] : 0;
+        return {
+          x: pts[i].x + (pts[i + 1].x - pts[i].x) * t,
+          y: pts[i].y + (pts[i + 1].y - pts[i].y) * t,
+        };
+      }
+      acc += segs[i];
+    }
+    return pts[pts.length - 1];
+  }
+
+  /* 去掉重复点与「三点共线」的中间点，路径干净，也少几个 DOM 属性数字 */
+  function dedupePts(pts) {
+    const out = pts.filter((p, i) =>
+      i === 0 || Math.abs(p.x - pts[i - 1].x) > 0.01 || Math.abs(p.y - pts[i - 1].y) > 0.01);
+    return out.filter((p, i) => {
+      if (i === 0 || i === out.length - 1) return true;
+      const a = out[i - 1], b = out[i + 1];
+      const cross = (p.x - a.x) * (b.y - p.y) - (p.y - a.y) * (b.x - p.x);
+      return Math.abs(cross) > 0.01;
+    });
+  }
+
+  /* 90° 直角：两端各走一小段出口（stub），中间按两边朝向补拐点 */
+  function orthoRaw(p1, s1, p2, s2) {
+    const stub = 22;
+    const d1 = SIDE_DIR[s1] || SIDE_DIR.right;
+    const d2 = SIDE_DIR[s2] || SIDE_DIR.left;
+    const a = { x: p1.x + d1.x * stub, y: p1.y + d1.y * stub };
+    const b = { x: p2.x + d2.x * stub, y: p2.y + d2.y * stub };
+    const h1 = d1.x !== 0, h2 = d2.x !== 0;
+    const pts = [p1, a];
+    if (h1 && h2) {
+      const mx = (a.x + b.x) / 2;
+      pts.push({ x: mx, y: a.y }, { x: mx, y: b.y });
+    } else if (!h1 && !h2) {
+      const my = (a.y + b.y) / 2;
+      pts.push({ x: a.x, y: my }, { x: b.x, y: my });
+    } else if (h1) {
+      pts.push({ x: b.x, y: a.y });
+    } else {
+      pts.push({ x: a.x, y: b.y });
+    }
+    pts.push(b, p2);
+    return pts;
+  }
+
+  function orthoPoints(p1, s1, p2, s2) {
+    return dedupePts(orthoRaw(p1, s1, p2, s2));
+  }
+
+  /* 45° 折角：从两端出口点之间插一段斜线，其余仍走直角 */
+  function diagPoints(p1, s1, p2, s2) {
+    const raw = orthoRaw(p1, s1, p2, s2);
+    const start = raw[1];
+    const end = raw[raw.length - 2];
+    const dx = end.x - start.x, dy = end.y - start.y;
+    const L = Math.min(Math.abs(dx), Math.abs(dy));
+    if (L < 6) return dedupePts(raw);          // 几乎对齐，斜不出来
+    const m = { x: start.x + Math.sign(dx) * L, y: start.y + Math.sign(dy) * L };
+    return dedupePts([p1, start, m, end, p2]);
+  }
+
+  const ptsToPath = (pts) =>
+    pts.map((p, i) => `${i ? "L" : "M"} ${Math.round(p.x * 100) / 100} ${Math.round(p.y * 100) / 100}`)
+      .join(" ");
+
   function edgeGeometry(e) {
     const a = nodeById(e.from.node), b = nodeById(e.to.node);
     if (!a || !b) return null;
     const p1 = anchorPos(a, e.from.side), p2 = anchorPos(b, e.to.side);
+    const route = ROUTES.includes(e.route) ? e.route : "curve";
+
+    if (route === "line") {
+      return {
+        d: `M ${p1.x} ${p1.y} L ${p2.x} ${p2.y}`,
+        mid: { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 },
+      };
+    }
+    if (route === "ortho" || route === "diag") {
+      const pts = route === "ortho"
+        ? orthoPoints(p1, e.from.side, p2, e.to.side)
+        : diagPoints(p1, e.from.side, p2, e.to.side);
+      return { d: ptsToPath(pts), mid: polyMid(pts) };
+    }
+
     const dx = Math.abs(p2.x - p1.x), dy = Math.abs(p2.y - p1.y);
     const horiz = e.from.side === "left" || e.from.side === "right";
     const h = Math.max(40, (horiz ? dx : dy) * 0.5);
@@ -275,6 +454,8 @@
   function clearSelection() {
     if (!selection.nodes.size && !selection.edges.size) return;
     selection = { nodes: new Set(), edges: new Set() };
+    const pop = $("#style-pop");
+    if (pop) pop.hidden = true;
     syncSelection();
   }
 
@@ -329,7 +510,11 @@
     const total = selection.nodes.size + selection.edges.size;
     bar.hidden = total === 0;
     $("#sel-label").hidden = selection.edges.size === 0;
-    if (!total) return;
+    if (!total) {
+      $("#style-pop").hidden = true;
+      updateSelOutline();
+      return;
+    }
     const box = selectionBBox();
     if (!box) { bar.hidden = true; return; }
     const r = wrap.getBoundingClientRect();
@@ -338,15 +523,59 @@
     if (top < 6) top = board.panY + box.y2 * board.scale + 10;
     bar.style.left = clamp(left, 6, Math.max(6, r.width - 260)) + "px";
     bar.style.top = clamp(top, 6, Math.max(6, r.height - 40)) + "px";
+    if (!$("#style-pop").hidden) positionStylePop();
+    updateStyleControls();
+    updateSelOutline();
+  }
+
+  /* 选中轮廓覆盖层：画在最上层（组在成员节点下面，轮廓必须盖住它们才看得清） */
+  function updateSelOutline() {
+    let ol = canvas.querySelector(":scope > .sel-outline");
+    if (!selection.nodes.size) { ol?.remove(); return; }
+    const box = selectionBBox();
+    if (!box) { ol?.remove(); return; }
+    if (!ol) {
+      ol = document.createElement("div");
+      ol.className = "sel-outline";
+      canvas.appendChild(ol);
+    }
+    // 保证覆盖层是最后一个子元素（SVG 边层之后），永远在最上
+    canvas.appendChild(ol);
+    ol.style.left = box.x + "px";
+    ol.style.top = box.y + "px";
+    ol.style.width = (box.x2 - box.x) + "px";
+    ol.style.height = (box.y2 - box.y) + "px";
+    ol.style.borderColor = "var(--accent)";
+  }
+
+  function positionStylePop() {
+    const pop = $("#style-pop");
+    const bar = $("#sel-toolbar");
+    if (!pop || pop.hidden || bar.hidden) return;
+    const wrapH = wrap.clientHeight;
+    const left = clamp(parseFloat(bar.style.left) || 0, 6,
+      Math.max(6, wrap.clientWidth - pop.offsetWidth - 8));
+    let top = (parseFloat(bar.style.top) || 0) + bar.offsetHeight + 6;
+    if (top + pop.offsetHeight > wrapH - 8) {
+      top = Math.max(6, (parseFloat(bar.style.top) || 0) - pop.offsetHeight - 6);
+    }
+    pop.style.left = left + "px";
+    pop.style.top = top + "px";
   }
 
   /* ---------- 节点渲染 ---------- */
+  /* 内容可以在画布/侧栏里直接改的类型：右下缺角画黑；图片这类只读的画黄 */
+  const EDITABLE_TYPES = new Set(["text", "md", "link", "group"]);
+
   function nodeClass(it) {
     const cls = ["b-item", "b-" + (it.type || "image")];
     if (it.color) cls.push("c" + it.color);
+    if (it.color && COLOR_HEX[it.color]) cls.push("tinted");
     if (selection.nodes.has(it.id)) cls.push("selected");
     if (it.type === "image" && !it.fileId) cls.push("missing");
     if (it.type === "comfy" && it.muted) cls.push("muted");
+    if (!EDITABLE_TYPES.has(it.type)) cls.push("no-edit");
+    if (it.pin) cls.push("pinned");
     return cls.join(" ");
   }
 
@@ -372,10 +601,16 @@ function comfyNodeHTML(it) {
       body.className = "b-text-body";
       body.textContent = it.text || "";
       el.appendChild(body);
+    } else if (it.type === "md") {
+      const body = document.createElement("div");
+      body.className = "b-md-body";
+      body.innerHTML = mdToHTML(it.text);
+      el.appendChild(body);
+      el.insertAdjacentHTML("beforeend", '<span class="md-badge">MD</span>');
     } else if (it.type === "comfy") {
       el.innerHTML = comfyNodeHTML(it);
     } else if (it.type === "link") {
-      el.innerHTML = `<div class="b-link"><span>🔗</span><span>${esc(it.url || "")}</span></div>`;
+      el.innerHTML = `<div class="b-link"><span>↗</span><span>${esc(it.url || "")}</span></div>`;
     } else if (it.type === "group") {
       el.innerHTML = `<div class="b-group-label">${esc(it.label || "分组")}</div>`;
     } else if (!it.fileId) {
@@ -397,21 +632,23 @@ function comfyNodeHTML(it) {
       el.appendChild(img);
     }
 
-    el.insertAdjacentHTML("beforeend",
-      `<div class="rz"></div><div class="b-del" title="删除节点">✕</div>`);
+    // 八向透明热区：四条边覆盖完整外轮廓，角区只负责斜向缩放，不画方块。
+    for (const d of ["n", "s", "e", "w", "ne", "nw", "se", "sw"]) {
+      el.insertAdjacentHTML("beforeend", `<div class="rz rz-${d}" data-dir="${d}" aria-hidden="true"></div>`);
+    }
     for (const side of SIDES) {
       const dot = document.createElement("div");
       dot.className = `anchor a-${side}`;
       dot.dataset.side = side;
       el.appendChild(dot);
     }
-    el.querySelector(".b-del").addEventListener("mousedown", (ev) => ev.stopPropagation());
-    el.querySelector(".b-del").addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      removeNodes([it.id]);
-      markDirty();
-      render();
-    });
+    // 右下缺角：墨色＝内容可编辑，黄色＝只读；固定后黄角里带图钉
+    el.insertAdjacentHTML("beforeend",
+      `<i class="b-cut" aria-hidden="true"><svg viewBox="0 0 12 12">
+        <path d="M7.4 1.4 10.6 4.6M8.6 2.6 5.4 5.8 3.6 6.2 2.2 9.8 5.8 8.4 6.2 6.6 9.4 3.4"
+          fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+      </svg></i>`);
+    applyNodeTextStyle(it, el);
     bindNode(el, it);
     return el;
   }
@@ -478,6 +715,7 @@ function comfyNodeHTML(it) {
 
   function render() {
     if (editingCommit) stopTextEdit();   // 重建 DOM 前先提交正在编辑的文本
+    hov = null;                          // 旧 DOM 已作废，悬停状态一起清掉
     canvas.innerHTML = "";
     const svg = document.createElementNS(svgNS, "svg");
     svg.setAttribute("class", "edge-layer");
@@ -498,35 +736,103 @@ function comfyNodeHTML(it) {
       if (g) svg.appendChild(g);
     }
     canvas.appendChild(svg);
-    for (const it of board.items) canvas.appendChild(buildNodeEl(it));
+    // 组永远先渲染，作为背景容器；普通节点后渲染，保证组内节点可选中。
+    const groups = board.items.filter((n) => n.type === "group");
+    const normal = board.items.filter((n) => n.type !== "group");
+    for (const it of groups) canvas.appendChild(buildNodeEl(it));
+    for (const it of normal) canvas.appendChild(buildNodeEl(it));
     applyTransform();
     updateSelToolbar();
     applyImgSrc();
   }
 
   /* ---------- 节点交互 ---------- */
+  function updateNodeFromInspector(it, value) {
+    if (it.type === "group") {
+      it.label = value;
+      const el = nodeEl(it.id);
+      const label = el?.querySelector(".b-group-label");
+      if (label) label.textContent = value;
+    } else if (it.type === "link") {
+      it.url = value;
+      const el = nodeEl(it.id);
+      const link = el?.querySelector(".b-link > span:last-child");
+      if (link) link.textContent = value;
+    } else if (it.type === "md") {
+      it.text = value;
+      const body = nodeEl(it.id)?.querySelector(".b-md-body");
+      if (body) body.innerHTML = mdToHTML(value);
+    } else {
+      it.text = value;
+      const body = nodeEl(it.id)?.querySelector(".b-text-body");
+      if (body) body.textContent = value;
+    }
+    if (selection.nodes.has(it.id)) window.setInspectorName?.(nodeTitle(it));
+    markDirty();
+  }
+
+  function previewNode(it) {
+    if (!it) return;
+    if (it.type === "image" && it.fileId) {
+      if (typeof selectImage === "function") selectImage(it.fileId);
+      if (typeof setInspector === "function") setInspector(true);
+      return;
+    }
+    if (typeof window.showBoardNodeInspector !== "function") return;
+    window.showBoardNodeInspector(it, {
+      onChange: (value) => updateNodeFromInspector(it, value),
+      onDelete: () => {
+        removeNodes([it.id]);
+        board.edges = board.edges.filter((e) => e.from.node !== it.id && e.to.node !== it.id);
+        selection = { nodes: new Set(), edges: new Set() };
+        markDirty();
+        render();
+        window.hideBoardNodeInspector?.();
+        const empty = $("#insp-empty");
+        if (empty) { empty.hidden = false; empty.textContent = "点画布上的图片、文字或 Markdown 节点，这里显示内容与参数。"; }
+      },
+      onDuplicate: () => {
+        selection = { nodes: new Set([it.id]), edges: new Set() };
+        syncSelection();
+        duplicateSelection();
+      },
+    });
+  }
+
   function bindNode(el, it) {
     el.addEventListener("mousedown", (ev) => {
       if (ev.button !== 0) return;
       if (spaceDown) return;                 // 空格按住时交给画布平移
       if (editingText === it.id) {
         // 点在编辑框里：交给浏览器放光标；点在框外：结束编辑再照常处理
-        if (ev.target.closest(".b-text-body")) return;
+        if (ev.target.closest(".b-text-body, .b-md-body")) return;
         stopTextEdit();
       }
       if (ev.target.classList.contains("anchor")) {
         startLink(ev, it, ev.target.dataset.side);
         return;
       }
+      // 缺角就是「固定」开关：把手没弹出时才可点，弹出后那个位置让给缩放把手
+      if (ev.target.closest(".b-cut") && !el.classList.contains("handles")) {
+        ev.stopPropagation();
+        ev.preventDefault();
+        if (!selection.nodes.has(it.id)) selectNode(it.id);
+        togglePin([it.id]);
+        return;
+      }
       ev.stopPropagation();
       const additive = ev.ctrlKey || ev.metaKey || ev.shiftKey;
       if (additive) {
         selectNode(it.id, true);
+        previewNode(it);
         return;
       }
       if (!selection.nodes.has(it.id)) selectNode(it.id);
+      previewNode(it);
       if (ev.target.classList.contains("rz")) {
-        if (selection.nodes.size === 1) startResize(ev, it, el);
+        // 单选才缩放；多选/无独占选中时抓到把手不吞事件，照常整组移动
+        if (selection.nodes.size === 1) startResize(ev, it, el, ev.target.dataset.dir || "se");
+        else startMove(ev);
         return;
       }
       startMove(ev);
@@ -534,23 +840,129 @@ function comfyNodeHTML(it) {
 
     el.addEventListener("dblclick", (ev) => {
       ev.stopPropagation();
-      if (it.type === "text") startTextEdit(it, el);
+      // 双击即选中并同步右侧介绍栏，避免"在改 A、侧栏还是 B"
+      if (!selection.nodes.has(it.id)) {
+        selectNode(it.id);
+        previewNode(it);
+      }
+      if (it.type === "text" || it.type === "md") startTextEdit(it, el);
       else if (it.type === "image" && it.fileId) openLightbox(it.fileId);
       else if (it.type === "link" && it.url) window.open(it.url, "_blank");
+      else if (it.type === "group") previewNode(it);
     });
 
     el.addEventListener("contextmenu", (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
       if (!selection.nodes.has(it.id)) selectNode(it.id);
+      previewNode(it);
       openNodeMenu(ev, it);
     });
   }
 
+  /* 组是容器：拖组时，中心点落在组里的节点一并移动（含嵌套组，递归展开）。 */
+  function withGroupMembers(ids) {
+    const out = new Set(ids);
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const gid of [...out]) {
+        const g = nodeById(gid);
+        if (!g || g.type !== "group") continue;
+        for (const n of board.items) {
+          if (out.has(n.id)) continue;
+          const cx = n.x + n.w / 2;
+          const cy = n.y + n.h / 2;
+          if (cx >= g.x && cx <= g.x + g.w && cy >= g.y && cy <= g.y + g.h) {
+            out.add(n.id);
+            grew = true;
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  /* ---------- 悬停边框 0.5 秒：强调当前边的菱形锚点（透明缩放热区常驻） ---------- */
+  const HANDLE_BAND = 22;     // 距边框多少 px 算「在边上」
+  const HANDLE_DELAY = 500;   // 停留多久才弹出来
+  let hov = null;             // { id, el, arm, hide }
+  /* 正在拖拽（移动/改大小/拉线/平移/框选）时，悬停逻辑一律不插手，
+     否则指针离开节点就会把刚弹出的把手收掉，拖到一半目标没了。 */
+  let dragging = false;
+  document.addEventListener("mouseup", () => { dragging = false; }, true);
+
+  function hoverSide(rect, cx, cy) {
+    const list = [
+      { s: "top", d: cy - rect.top },
+      { s: "bottom", d: rect.bottom - cy },
+      { s: "left", d: cx - rect.left },
+      { s: "right", d: rect.right - cx },
+    ].sort((a, b) => a.d - b.d);
+    return list[0].d <= HANDLE_BAND ? list[0].s : "";
+  }
+
+  function dropHover() {
+    if (!hov) return;
+    clearTimeout(hov.arm);
+    clearTimeout(hov.hide);
+    hov.el.classList.remove("handles");
+    hov = null;
+  }
+
+  function onHoverMove(ev) {
+    if (spaceDown || dragging) return;            // 拖动/平移时不插手
+    const el = ev.target?.closest?.(".b-item");
+    if (!el) { dropHover(); return; }
+    const id = el.dataset.node;
+    if (!hov || hov.id !== id) {
+      dropHover();
+      hov = { id, el, arm: 0, hide: 0 };
+    }
+    const side = hoverSide(el.getBoundingClientRect(), ev.clientX, ev.clientY);
+    if (side) {
+      el.dataset.hs = side;
+      clearTimeout(hov.hide); hov.hide = 0;
+      if (!el.classList.contains("handles") && !hov.arm) {
+        hov.arm = setTimeout(() => {
+          hov.arm = 0;
+          el.classList.add("handles");
+        }, HANDLE_DELAY);
+      }
+      return;
+    }
+    // 指针进到节点内部：已经弹出的把手先留着，别一闪一闪
+    if (!el.classList.contains("handles")) {
+      clearTimeout(hov.arm);
+      hov.arm = 0;
+    }
+  }
+
+  wrap.addEventListener("mousemove", onHoverMove);
+  wrap.addEventListener("mouseleave", dropHover);
+
+  /* ---------- 固定：钉住的节点不能被拖动/改大小 ---------- */
+  function togglePin(ids) {
+    const list = ids && ids.length ? ids : [...selection.nodes];
+    if (!list.length) return;
+    const target = list.map(nodeById).filter(Boolean);
+    const pin = !target.every((n) => n.pin);   // 有一个没固定就全部固定
+    for (const n of target) {
+      if (pin) n.pin = true;
+      else delete n.pin;
+    }
+    for (const n of target) nodeEl(n.id)?.classList.toggle("pinned", !!n.pin);
+    markDirty();
+    toast(pin ? "已固定：位置与大小锁定" : "已取消固定");
+  }
+
   function startMove(ev) {
+    dragging = true;
     const drag = [];
-    for (const id of selection.nodes) {
+    const moving = withGroupMembers(selection.nodes);
+    for (const id of moving) {
       const n = nodeById(id);
+      if (n && n.pin) continue;                  // 固定住的节点不跟着拖
       const el = nodeEl(id);
       if (n && el) drag.push({ n, el, ox: n.x, oy: n.y });
     }
@@ -581,22 +993,44 @@ function comfyNodeHTML(it) {
     ev.preventDefault();
   }
 
-  function startResize(ev, it, el) {
+  function startResize(ev, it, el, dir) {
+    if (it.pin) { toast("节点已固定，先取消固定再改大小"); return; }
+    dragging = true;
     const sx = ev.clientX, sy = ev.clientY;
-    const ow = it.w, oh = it.h;
-    const keepRatio = it.type === "image" && !ev.altKey;
-    const ratio = oh / Math.max(1, ow);
+    const o = { x: it.x, y: it.y, w: it.w, h: it.h };
+    // 默认完全自由（宽高各改各的），按住 Shift 才锁原始比例
+    const keepRatio = !!(ev.shiftKey || ev.ctrlKey);
+    const ratio = o.h / Math.max(1, o.w);
+    const has = (c) => dir.includes(c);
     let resized = false;
     const onMove = (e) => {
-      let w = Math.max(MIN_W, Math.round(ow + (e.clientX - sx) / board.scale));
-      let h = Math.max(MIN_H, Math.round(oh + (e.clientY - sy) / board.scale));
-      if (keepRatio) h = Math.max(MIN_H, Math.round(w * ratio));
-      it.w = w; it.h = h;
-      el.style.width = w + "px";
-      el.style.height = h + "px";
+      const dx = (e.clientX - sx) / board.scale;
+      const dy = (e.clientY - sy) / board.scale;
+      let x = o.x, y = o.y, w = o.w, h = o.h;
+      if (has("e")) w = o.w + dx;
+      if (has("w")) { w = o.w - dx; x = o.x + dx; }
+      if (has("s")) h = o.h + dy;
+      if (has("n")) { h = o.h - dy; y = o.y + dy; }
+      if (keepRatio) {
+        if (!has("e") && !has("w")) {          // 纯上下边：以高驱动
+          h = Math.max(MIN_H, h);
+          w = Math.max(MIN_W, Math.round(h / ratio));
+        } else {                                // 有横向分量：以宽驱动
+          w = Math.max(MIN_W, w);
+          h = Math.max(MIN_H, Math.round(w * ratio));
+          if (has("n")) y = o.y + (o.h - h);
+        }
+        if (has("w")) x = o.x + (o.w - w);
+      }
+      it.x = Math.round(x); it.y = Math.round(y);
+      it.w = Math.max(MIN_W, Math.round(w)); it.h = Math.max(MIN_H, Math.round(h));
+      el.style.left = it.x + "px";
+      el.style.top = it.y + "px";
+      el.style.width = it.w + "px";
+      el.style.height = it.h + "px";
       resized = true;
       redrawEdges();
-      updateSelToolbar();
+      updateSelToolbar(); updateSelOutline();
     };
     const onUp = () => {
       document.removeEventListener("mousemove", onMove);
@@ -622,13 +1056,19 @@ function comfyNodeHTML(it) {
   }
 
   function startTextEdit(it, el) {
-    const body = el.querySelector(".b-text-body");
+    // 文本节点改纯文本；Markdown 节点在画布上直接改源码，失焦后重新渲染
+    const isMd = it.type === "md";
+    const body = el.querySelector(isMd ? ".b-md-body" : ".b-text-body");
     if (!body) return;
     if (editingText === it.id) return;
     if (editingCommit) stopTextEdit();
     editingText = it.id;
     el.classList.add("editing");
     body.classList.add("editing");
+    if (isMd) {
+      body.textContent = it.text || "";
+      body.classList.add("md-raw");
+    }
     body.contentEditable = "true";
     body.focus();
     try { document.getSelection().selectAllChildren(body); } catch { /* ignore */ }
@@ -641,7 +1081,12 @@ function comfyNodeHTML(it) {
       body.classList.remove("editing");
       el.classList.remove("editing");
       it.text = body.innerText.replace(/\n$/, "");
+      if (isMd) {
+        body.classList.remove("md-raw");
+        body.innerHTML = mdToHTML(it.text);
+      }
       markDirty();
+      if (selection.nodes.has(it.id)) previewNode(it);
     };
     editingCommit = done;
 
@@ -650,12 +1095,40 @@ function comfyNodeHTML(it) {
       ev.stopPropagation();
       if (ev.key === "Escape") { ev.preventDefault(); body.blur(); }
     });
-    // 尺寸由用户拖角决定：内容超出时框内滚动，不再自动长高
+    // 尺寸由用户拖动外轮廓决定：内容超出时框内滚动，不再自动长高
     body.addEventListener("input", () => { markDirty(); });
   }
 
   /* ---------- 连线 ---------- */
+  function clearLinkTargets() {
+    canvas.querySelectorAll(".link-target").forEach((el) => el.classList.remove("link-target"));
+  }
+
+  /* 优先命中真实菱形，而不是只按两个节点的相对位置猜连接方向。 */
+  function hitAnchor(cx, cy) {
+    const anchors = [...canvas.querySelectorAll(".b-item .anchor")].reverse();
+    for (const anchor of anchors) {
+      const r = anchor.getBoundingClientRect();
+      if (cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom) {
+        const el = anchor.closest(".b-item");
+        return { id: el.dataset.node, side: anchor.dataset.side, el, anchor };
+      }
+    }
+    return null;
+  }
+
+  /* 拖到节点主体时仍允许连线：终点取离释放位置最近的那条边。 */
+  function nearestNodeSide(n, p) {
+    return [
+      { side: "top", d: Math.abs(p.y - n.y) },
+      { side: "right", d: Math.abs(p.x - n.x - n.w) },
+      { side: "bottom", d: Math.abs(p.y - n.y - n.h) },
+      { side: "left", d: Math.abs(p.x - n.x) },
+    ].sort((a, b) => a.d - b.d)[0].side;
+  }
+
   function startLink(ev, fromNode, fromSide) {
+    dragging = true;
     ev.stopPropagation();
     ev.preventDefault();
     const svg = scene();
@@ -667,28 +1140,28 @@ function comfyNodeHTML(it) {
     const onMove = (e) => {
       const p = toWorld(e.clientX, e.clientY);
       temp.setAttribute("d", `M ${p0.x} ${p0.y} L ${p.x} ${p.y}`);
-      canvas.querySelectorAll(".b-item.link-target").forEach((n) => n.classList.remove("link-target"));
-      const hit = hitNode(e.clientX, e.clientY);
-      if (hit && hit.id !== fromNode.id) hit.el.classList.add("link-target");
+      clearLinkTargets();
+      const hit = hitAnchor(e.clientX, e.clientY) || hitNode(e.clientX, e.clientY);
+      if (hit && hit.id !== fromNode.id) {
+        hit.el.classList.add("link-target");
+        hit.anchor?.classList.add("link-target");
+      }
     };
     const onUp = (e) => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
       temp.remove();
-      canvas.querySelectorAll(".b-item.link-target").forEach((n) => n.classList.remove("link-target"));
-      const hit = hitNode(e.clientX, e.clientY);
+      clearLinkTargets();
+      const anchor = hitAnchor(e.clientX, e.clientY);
+      const hit = anchor || hitNode(e.clientX, e.clientY);
       if (!hit || hit.id === fromNode.id) return;
       const toNode = nodeById(hit.id);
       if (!toNode) return;
-      const dx = toNode.x + toNode.w / 2 - (fromNode.x + fromNode.w / 2);
-      const dy = toNode.y + toNode.h / 2 - (fromNode.y + fromNode.h / 2);
-      const horizontal = Math.abs(dx) > Math.abs(dy);
-      const toSide = horizontal ? (dx > 0 ? "left" : "right") : (dy > 0 ? "top" : "bottom");
-      const fSide = horizontal ? (dx > 0 ? "right" : "left") : (dy > 0 ? "bottom" : "top");
       board.edges.push({
         id: uid("e"),
-        from: { node: fromNode.id, side: fSide },
-        to: { node: toNode.id, side: toSide },
+        // 起点必须保留用户抓取的菱形，不能再按节点方位改回右侧。
+        from: { node: fromNode.id, side: fromSide },
+        to: { node: toNode.id, side: anchor ? anchor.side : nearestNodeSide(toNode, toWorld(e.clientX, e.clientY)) },
       });
       markDirty();
       render();
@@ -771,6 +1244,7 @@ function comfyNodeHTML(it) {
       copy.id = uid(copy.type === "text" ? "t" : "n");
       copy.x += dx;
       copy.y += dy;
+      delete copy.pin;              // 复制出来的节点不继承「固定」，否则一放下就拖不动
       idMap.set(n.id, copy.id);
       return copy;
     });
@@ -802,17 +1276,25 @@ function comfyNodeHTML(it) {
   function reorderSelection(front) {
     if (!selection.nodes.size) return;
     const picked = board.items.filter((n) => selection.nodes.has(n.id));
-    const rest = board.items.filter((n) => !selection.nodes.has(n.id));
-    board.items = front ? [...rest, ...picked] : [...picked, ...rest];
+    // 组只能调整组与组之间的前后关系，不能跑到普通节点上方
+    const allGroups = picked.every((n) => n.type === "group");
+    const groups = board.items.filter((n) => n.type === "group");
+    const normal = board.items.filter((n) => n.type !== "group");
+    const inPicked = (n) => selection.nodes.has(n.id);
+    const domain = allGroups ? groups : normal;
+    const pickedInDomain = domain.filter(inPicked);
+    const rest = domain.filter((n) => !inPicked(n));
+    const ordered = front ? [...rest, ...pickedInDomain] : [...pickedInDomain, ...rest];
+    board.items = allGroups ? [...ordered, ...normal] : [...groups, ...ordered];
     markDirty();
     render();
   }
 
   function nudge(dx, dy) {
     if (!selection.nodes.size) return;
-    for (const id of selection.nodes) {
+    for (const id of withGroupMembers(selection.nodes)) {
       const n = nodeById(id);
-      if (!n) continue;
+      if (!n || n.pin) continue;
       n.x += dx; n.y += dy;
       const el = nodeEl(id);
       if (el) { el.style.left = n.x + "px"; el.style.top = n.y + "px"; }
@@ -852,9 +1334,57 @@ function comfyNodeHTML(it) {
     }
   }
 
+  function primarySelectedNode() {
+    for (const id of selection.nodes) {
+      const n = nodeById(id);
+      if (n) return n;
+    }
+    return null;
+  }
+
+  function updateStyleControls() {
+    const n = primarySelectedNode();
+    if (!n) return;
+    const color = $("#style-text-color");
+    if (color) color.value = n.textColor || "#161616";
+    const size = $("#style-font-size");
+    if (size) size.value = n.fontSize ? String(n.fontSize) : "";
+    const family = $("#style-font-family");
+    if (family) family.value = n.fontFamily || "";
+    const line = $("#style-line-height");
+    if (line) line.value = n.lineHeight ? String(n.lineHeight) : "";
+    document.querySelectorAll("#style-align button").forEach((b) =>
+      b.classList.toggle("active", (n.textAlign || "left") === b.dataset.align));
+  }
+
+  function setSelectionTextStyle(patch) {
+    let changed = false;
+    for (const id of selection.nodes) {
+      const n = nodeById(id);
+      if (!n) continue;
+      for (const [key, value] of Object.entries(patch)) {
+        if (value === "" || value == null) delete n[key];
+        else n[key] = value;
+      }
+      const el = nodeEl(id);
+      if (el) applyNodeTextStyle(n, el);
+      changed = true;
+    }
+    if (!changed) return;
+    markDirty();
+    updateStyleControls();
+  }
+
+  function resetSelectionTextStyle() {
+    setSelectionTextStyle({
+      textColor: "", fontSize: "", textAlign: "", fontFamily: "", lineHeight: "",
+    });
+  }
+
   /* ---------- 框选 / 平移 / 缩放 ---------- */
   wrap.addEventListener("contextmenu", (ev) => {
-    if (ev.target.closest("#sel-toolbar")) return;
+    if (ev.target.closest("#sel-toolbar") || ev.target.closest("#style-pop") ||
+        ev.target.closest("#canvas-dock")) return;
     if (ev.target.closest(".b-item") || ev.target.closest("g[data-edge]")) return;
     ev.preventDefault();
     clearSelection();
@@ -862,7 +1392,8 @@ function comfyNodeHTML(it) {
   });
 
   wrap.addEventListener("mousedown", (ev) => {
-    if (ev.target.closest("#sel-toolbar")) return;
+    if (ev.target.closest("#sel-toolbar") || ev.target.closest("#style-pop") ||
+        ev.target.closest("#canvas-dock")) return;
     if (ev.button === 1 || spaceDown || (ev.button === 0 && ev.altKey)) {
       ev.preventDefault();
       startPan(ev);
@@ -874,6 +1405,7 @@ function comfyNodeHTML(it) {
   });
 
   function startPan(ev) {
+    dragging = true;
     const sx = ev.clientX - board.panX, sy = ev.clientY - board.panY;
     wrap.classList.add("panning");
     const onMove = (e) => {
@@ -892,6 +1424,7 @@ function comfyNodeHTML(it) {
   }
 
   function startMarquee(ev) {
+    dragging = true;
     const additive = ev.shiftKey || ev.ctrlKey || ev.metaKey;
     const base = additive
       ? { nodes: new Set(selection.nodes), edges: new Set(selection.edges) }
@@ -934,10 +1467,28 @@ function comfyNodeHTML(it) {
     document.addEventListener("mouseup", onUp);
   }
 
+  /* 滚轮平滑缩放：rAF 向目标 scale 指数收敛（~100ms），锚点跟随鼠标 */
+  let zoomTarget = null, zoomRAF = null, zoomAnchorPt = null;
+  function zoomSmoothTo(next, cx, cy) {
+    zoomTarget = clamp(next, 0.08, 4);
+    zoomAnchorPt = { x: cx, y: cy };
+    if (!zoomRAF) zoomRAF = requestAnimationFrame(zoomStep);
+  }
+  function zoomStep() {
+    const diff = zoomTarget - board.scale;
+    if (Math.abs(diff) < 0.002) {
+      setZoom(zoomTarget, zoomAnchorPt?.x, zoomAnchorPt?.y);
+      zoomRAF = null;
+      return;
+    }
+    setZoom(board.scale + diff * 0.25, zoomAnchorPt?.x, zoomAnchorPt?.y);
+    zoomRAF = requestAnimationFrame(zoomStep);
+  }
+
   wrap.addEventListener("wheel", (ev) => {
     ev.preventDefault();
     if (ev.ctrlKey && !ev.deltaY) return;
-    setZoom(board.scale * (ev.deltaY < 0 ? 1.12 : 1 / 1.12), ev.clientX, ev.clientY);
+    zoomSmoothTo(board.scale * (ev.deltaY < 0 ? 1.25 : 1 / 1.25), ev.clientX, ev.clientY);
   }, { passive: false });
 
   document.addEventListener("keydown", (ev) => {
@@ -996,7 +1547,7 @@ function comfyNodeHTML(it) {
 
   function openNodeMenu(ev, it) {
     const items = [];
-    if (it.type === "text") items.push({ label: "编辑文本", fn: () => {
+    if (it.type === "text" || it.type === "md") items.push({ label: "在画布上直接编辑", fn: () => {
       const el = nodeEl(it.id);
       if (el) startTextEdit(it, el);
     } });
@@ -1023,14 +1574,26 @@ function comfyNodeHTML(it) {
     items.push({ label: "置于顶层", fn: () => reorderSelection(true) });
     items.push({ label: "置于底层", fn: () => reorderSelection(false) });
     items.push({ sep: true });
+    items.push({
+      label: it.pin ? "取消固定" : "固定（锁定位置与大小）",
+      fn: () => togglePin(selection.nodes.has(it.id) ? [...selection.nodes] : [it.id]),
+    });
+    items.push({ sep: true });
     items.push({ label: "删除", danger: true, fn: () => { deleteSelection(); } });
     openMenu(ev, items);
   }
 
   function openEdgeMenu(ev, e) {
+    const cur = ROUTES.includes(e.route) ? e.route : "curve";
+    const routeItems = ROUTES.map((r) => ({
+      label: (r === cur ? "✓ " : "　") + "走线：" + ROUTE_LABEL[r],
+      fn: () => { e.route = r; markDirty(); render(); },
+    }));
     openMenu(ev, [
       { label: "编辑标签…", fn: () => editEdge(e) },
       { label: "清除标签", disabled: !e.label, fn: () => { delete e.label; markDirty(); render(); } },
+      { sep: true },
+      ...routeItems,
       { sep: true },
       { label: "箭头：末端", fn: () => { e.toEnd = "arrow"; delete e.fromEnd; markDirty(); render(); } },
       { label: "箭头：双向", fn: () => { e.toEnd = "arrow"; e.fromEnd = "arrow"; markDirty(); render(); } },
@@ -1158,11 +1721,101 @@ function comfyNodeHTML(it) {
     render();
     const el = nodeEl(it.id);
     if (el) startTextEdit(it, el);
+    previewNode(it);
   }
 
-  $("#board-add-text").addEventListener("click", async () => {
+  function addMarkdownNode(world, text = "# 新文档\n\n在这里写 Markdown。\n\n- 支持标题\n- 支持列表\n- 支持 `行内代码` 和 **粗体**") {
+    const c = world || toWorld(
+      wrap.getBoundingClientRect().left + wrap.clientWidth / 2,
+      wrap.getBoundingClientRect().top + wrap.clientHeight / 2);
+    const it = {
+      id: uid("m"), type: "md", text,
+      x: Math.round(c.x - 160), y: Math.round(c.y - 110), w: 320, h: 220,
+    };
+    board.items.push(it);
+    selection = { nodes: new Set([it.id]), edges: new Set() };
+    markDirty();
+    render();
+    previewNode(it);
+    setTimeout(() => $("#insp-node-text")?.focus(), 40);
+  }
+
+  function addLinkNode(world, url = "https://") {
+    const c = world || toWorld(
+      wrap.getBoundingClientRect().left + wrap.clientWidth / 2,
+      wrap.getBoundingClientRect().top + wrap.clientHeight / 2);
+    const it = {
+      id: uid("l"), type: "link", url,
+      x: Math.round(c.x - 130), y: Math.round(c.y - 40), w: 260, h: 80,
+    };
+    board.items.push(it);
+    selection = { nodes: new Set([it.id]), edges: new Set() };
+    markDirty();
+    render();
+    previewNode(it);
+    setTimeout(() => {
+      const input = $("#insp-node-text");
+      if (input) { input.focus(); input.select(); }
+    }, 40);
+  }
+
+  function addGroupNode(world) {
+    let box = null;
+    for (const id of selection.nodes) {
+      const n = nodeById(id);
+      if (!n || n.type === "group") continue;
+      box = box
+        ? { x: Math.min(box.x, n.x), y: Math.min(box.y, n.y),
+            x2: Math.max(box.x2, n.x + n.w), y2: Math.max(box.y2, n.y + n.h) }
+        : { x: n.x, y: n.y, x2: n.x + n.w, y2: n.y + n.h };
+    }
+    let it;
+    if (box) {
+      const padX = 36, top = 46, bottom = 32;
+      it = normalizeNode({
+        id: uid("g"), type: "group",
+        label: `分组 ${board.items.filter((n) => n.type === "group").length + 1}`,
+        x: Math.round(box.x - padX), y: Math.round(box.y - top),
+        w: Math.round(box.x2 - box.x + padX * 2),
+        h: Math.round(box.y2 - box.y + top + bottom),
+      });
+    } else {
+      const c = world || toWorld(
+        wrap.getBoundingClientRect().left + wrap.clientWidth / 2,
+        wrap.getBoundingClientRect().top + wrap.clientHeight / 2);
+      it = normalizeNode({
+        id: uid("g"), type: "group", label: "新分组",
+        x: Math.round(c.x - 220), y: Math.round(c.y - 150), w: 440, h: 300,
+      });
+    }
+    // 组加入数组最前；render 还会强制组先画，双重保证它在成员节点下方
+    board.items.unshift(it);
+    selection = { nodes: new Set([it.id]), edges: new Set() };
+    markDirty();
+    render();
+    previewNode(it);
+    toast(box ? "已用选中节点创建分组" : "已创建空分组，可拖入图片或文字");
+  }
+
+  $("#board-add-text")?.addEventListener("click", async () => {
     await ensureBoard();
     addTextNode(null);
+  });
+
+  document.querySelectorAll("#canvas-dock button[data-add]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try { await ensureBoard(); }
+      catch (e) { toast("创建画板失败：" + (e && e.message ? e.message : e)); return; }
+      const kind = btn.dataset.add;
+      if (kind === "text") addTextNode(null);
+      else if (kind === "md") addMarkdownNode(null);
+      else if (kind === "group") addGroupNode(null);
+      else if (kind === "link") {
+        const url = await appPrompt("链接地址：", "https://");
+        if (!url) return;
+        addLinkNode(null, url.trim());
+      }
+    });
   });
 
   /* ---------- 拖放图片上板（同一张图可重复放入） ---------- */
@@ -1200,14 +1853,62 @@ function comfyNodeHTML(it) {
     await save();
   });
 
-  /* ---------- 素材抽屉 ---------- */
+  /* ---------- 素材抽屉：跟随左侧文件夹 + 可选标签 ---------- */
   let drawerIO = null;
+  let drawerSeq = 0;
+  const drawerOpts = {
+    subfolders: localStorage.getItem("texture.drawerSubfolders") !== "0",
+    tags: localStorage.getItem("texture.drawerTags") === "1",
+  };
+
+  function galleryFilter() {
+    try {
+      return state.filter || {};
+    } catch {
+      return {};
+    }
+  }
+
+  function syncDrawerOpts() {
+    const a = $("#drawer-subfolders");
+    const b = $("#drawer-tags");
+    if (a) {
+      a.classList.toggle("active", drawerOpts.subfolders);
+      a.setAttribute("aria-pressed", String(drawerOpts.subfolders));
+    }
+    if (b) {
+      b.classList.toggle("active", drawerOpts.tags);
+      b.setAttribute("aria-pressed", String(drawerOpts.tags));
+    }
+  }
+
   async function loadDrawer() {
     const strip = $("#drawer-strip");
-    const data = await api("/api/images");
+    const seq = ++drawerSeq;
+    const f = galleryFilter();
+    const qs = new URLSearchParams();
+    if (f.dir) qs.set("dir", f.dir);
+    if (f.family) qs.set("family", f.family);
+    if (f.fav) qs.set("fav", "true");
+    if (drawerOpts.tags && f.tag) qs.set("tag", f.tag);
+    qs.set("subfolders", drawerOpts.subfolders ? "true" : "false");
+    strip.innerHTML = '<div class="drawer-more">读取素材…</div>';
+    let data;
+    try {
+      data = await api("/api/images?" + qs);
+    } catch (e) {
+      if (seq === drawerSeq) strip.innerHTML = `<div class="drawer-more">素材读取失败：${esc(e.message || e)}</div>`;
+      return;
+    }
+    if (seq !== drawerSeq) return;
     strip.innerHTML = "";
+    const count = $("#drawer-count");
+    if (count) {
+      const scope = f.dir ? baseName(f.dir) : "全部图片";
+      count.textContent = `${scope} · ${data.items.length}`;
+    }
     if (!data.items.length) {
-      strip.innerHTML = '<div class="drawer-more">图库为空，先添加文件夹</div>';
+      strip.innerHTML = '<div class="drawer-more">当前文件夹没有图片；可调整左侧目录或开启“显示子文件夹”。</div>';
       return;
     }
     const io = drawerIO || (drawerIO = new IntersectionObserver((entries) => {
@@ -1221,7 +1922,10 @@ function comfyNodeHTML(it) {
     }, { root: null, rootMargin: "300px" }));
 
     for (const it of data.items.slice(0, 400)) {
-      const cell = createAssetCell(it, { onClick: () => selectImage(it.id) });
+      const cell = createAssetCell(it, { onClick: () => {
+        if (typeof selectImage === "function") selectImage(it.id);
+        if (typeof setInspector === "function") setInspector(true);
+      } });
       cell.classList.add("drawer-cell");
       const img = cell.querySelector("img");
       img.removeAttribute("loading");
@@ -1231,7 +1935,7 @@ function comfyNodeHTML(it) {
     if (data.items.length > 400) {
       const more = document.createElement("div");
       more.className = "drawer-more";
-      more.textContent = `仅显示前 400 张（共 ${data.items.length}），可用搜索缩小范围`;
+      more.textContent = `仅显示前 400 张（共 ${data.items.length}），可缩小文件夹范围`;
       strip.appendChild(more);
     }
   }
@@ -1240,10 +1944,28 @@ function comfyNodeHTML(it) {
     const d = $("#drawer");
     d.classList.toggle("collapsed");
     $("#drawer-toggle").classList.toggle("active", !d.classList.contains("collapsed"));
-    if (!d.classList.contains("collapsed") && !d.dataset.loaded) {
+    if (!d.classList.contains("collapsed")) {
+      syncDrawerOpts();
       await loadDrawer();
-      d.dataset.loaded = "1";
     }
+  });
+  $("#drawer-subfolders").addEventListener("click", () => {
+    drawerOpts.subfolders = !drawerOpts.subfolders;
+    localStorage.setItem("texture.drawerSubfolders", drawerOpts.subfolders ? "1" : "0");
+    syncDrawerOpts();
+    if (!$("#drawer").classList.contains("collapsed")) loadDrawer();
+  });
+  $("#drawer-tags").addEventListener("click", () => {
+    drawerOpts.tags = !drawerOpts.tags;
+    localStorage.setItem("texture.drawerTags", drawerOpts.tags ? "1" : "0");
+    syncDrawerOpts();
+    if (!$("#drawer").classList.contains("collapsed")) loadDrawer();
+  });
+  let drawerTimer = null;
+  window.addEventListener("texture:gallery-updated", () => {
+    if ($("#drawer").classList.contains("collapsed")) return;
+    clearTimeout(drawerTimer);
+    drawerTimer = setTimeout(loadDrawer, 120);
   });
 
   /* ---------- 工具栏 ---------- */
@@ -1434,6 +2156,39 @@ function comfyNodeHTML(it) {
     if (e) editEdge(e);
   });
 
+  $("#sel-style").addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    const pop = $("#style-pop");
+    pop.hidden = !pop.hidden;
+    if (!pop.hidden) {
+      updateStyleControls();
+      requestAnimationFrame(positionStylePop);
+    }
+  });
+  $("#style-pop").addEventListener("mousedown", (ev) => ev.stopPropagation());
+  $("#style-text-color").addEventListener("input", (ev) =>
+    setSelectionTextStyle({ textColor: ev.target.value }));
+  $("#style-text-default").addEventListener("click", () =>
+    setSelectionTextStyle({ textColor: "" }));
+  $("#style-font-size").addEventListener("change", (ev) =>
+    setSelectionTextStyle({ fontSize: ev.target.value }));
+  $("#style-font-family").addEventListener("change", (ev) =>
+    setSelectionTextStyle({ fontFamily: ev.target.value }));
+  $("#style-line-height").addEventListener("change", (ev) =>
+    setSelectionTextStyle({ lineHeight: ev.target.value }));
+  document.querySelectorAll("#style-align button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      setSelectionTextStyle({ textAlign: btn.dataset.align });
+    });
+  });
+  $("#style-reset").addEventListener("click", resetSelectionTextStyle);
+  document.addEventListener("mousedown", (ev) => {
+    const pop = $("#style-pop");
+    if (!pop || pop.hidden) return;
+    if (ev.target.closest("#style-pop") || ev.target.closest("#sel-style")) return;
+    pop.hidden = true;
+  });
+
   /* ---------- 白板键盘 ---------- */
   document.addEventListener("keydown", (ev) => {
     if ($("#view-board").hidden || editingText) return;
@@ -1443,19 +2198,32 @@ function comfyNodeHTML(it) {
     const mod = ev.ctrlKey || ev.metaKey;
     const step = ev.shiftKey ? 10 : 1;
 
-    if (ev.key === "Escape") { clearSelection(); return; }
-    if (ev.key === "?") { $("#shortcuts").hidden = !$("#shortcuts").hidden; return; }
-    if (!mod && (ev.key === "i" || ev.key === "I")) {
+    if (ev.key === "Escape") {
+      if (!$("#style-pop").hidden) { $("#style-pop").hidden = true; return; }
+      clearSelection();
+      return;
+    }
+    if (Hotkeys.match(ev, "board.text")) {
+      ev.preventDefault(); $("#canvas-dock button[data-add='text']")?.click(); return;
+    }
+    if (Hotkeys.match(ev, "board.md")) {
+      ev.preventDefault(); $("#canvas-dock button[data-add='md']")?.click(); return;
+    }
+    if (Hotkeys.match(ev, "board.group")) {
+      ev.preventDefault(); $("#canvas-dock button[data-add='group']")?.click(); return;
+    }
+    if (Hotkeys.match(ev, "gallery.panel")) { Hotkeys.renderPanel(); $("#shortcuts").hidden = !$("#shortcuts").hidden; return; }
+    if (Hotkeys.match(ev, "gallery.info")) {
       setInspector(!$("#main").classList.contains("insp-open")); return;
     }
-    if (!mod && (ev.key === "n" || ev.key === "N")) {
+    if (Hotkeys.match(ev, "gallery.nav")) {
       setNav(document.body.classList.contains("nav-closed")); return;
     }
-    if ((ev.key === "Delete" || ev.key === "Backspace")) {
+    if (Hotkeys.match(ev, "board.del") || ev.key === "Backspace") {
       if (selection.nodes.size || selection.edges.size) { ev.preventDefault(); deleteSelection(); }
       return;
     }
-    if (mod && (ev.key === "d" || ev.key === "D")) {
+    if (Hotkeys.match(ev, "board.dup")) {
       if (selection.nodes.size) { ev.preventDefault(); duplicateSelection(); }
       return;
     }
@@ -1474,17 +2242,18 @@ function comfyNodeHTML(it) {
     if (ev.key === "ArrowRight") { ev.preventDefault(); nudge(step, 0); return; }
     if (ev.key === "ArrowUp") { ev.preventDefault(); nudge(0, -step); return; }
     if (ev.key === "ArrowDown") { ev.preventDefault(); nudge(0, step); return; }
-    if (!mod && (ev.key === "f" || ev.key === "F")) { ev.preventDefault(); fitView(); return; }
-    if (ev.key === "0") { ev.preventDefault(); setZoom(1); return; }
+    if (Hotkeys.match(ev, "board.fit")) { ev.preventDefault(); fitView(); return; }
+    if (Hotkeys.match(ev, "board.z100")) { ev.preventDefault(); setZoom(1); return; }
     if (ev.key === "+" || ev.key === "=") { ev.preventDefault(); zoomAtCenter(1.2); return; }
     if (ev.key === "-" || ev.key === "_") { ev.preventDefault(); zoomAtCenter(1 / 1.2); return; }
-    if (ev.key === "[") { ev.preventDefault(); reorderSelection(false); return; }
-    if (ev.key === "]") { ev.preventDefault(); reorderSelection(true); return; }
+    if (Hotkeys.match(ev, "board.back")) { ev.preventDefault(); reorderSelection(false); return; }
+    if (Hotkeys.match(ev, "board.front")) { ev.preventDefault(); reorderSelection(true); return; }
   });
 
   /* 双击空白：新建文本节点 */
   wrap.addEventListener("dblclick", (ev) => {
-    if (ev.target.closest("#sel-toolbar")) return;
+    if (ev.target.closest("#sel-toolbar") || ev.target.closest("#style-pop") ||
+        ev.target.closest("#canvas-dock")) return;
     if (ev.target.closest(".b-item") || ev.target.closest("g[data-edge]")) return;
     addTextNode(toWorld(ev.clientX, ev.clientY));
   });
@@ -1534,9 +2303,9 @@ function comfyNodeHTML(it) {
 
   onSwitchToBoard = async () => {
     await loadBoards(board.id);
-    if (!$("#drawer").classList.contains("collapsed") && !$("#drawer").dataset.loaded) {
+    syncDrawerOpts();
+    if (!$("#drawer").classList.contains("collapsed")) {
       await loadDrawer();
-      $("#drawer").dataset.loaded = "1";
     }
   };
 
@@ -1557,6 +2326,7 @@ function comfyNodeHTML(it) {
   window.addEventListener("resize", () => updateSelToolbar());
 
   buildColorSwatches();
+  syncDrawerOpts();
 
   /* 保存状态插在画板下拉框后 */
   const statusEl = document.createElement("span");

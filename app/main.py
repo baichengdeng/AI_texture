@@ -18,7 +18,7 @@ from .comfy_graph import graph_to_board, read_graph_for_file
 from .export import board_to_canvas, board_to_html, to_a1111_text
 from .metadata import router as meta_router
 from .scanner import Scanner, fid_for
-from .store import DATA_DIR, Store
+from .store import DATA_DIR, Store, clean_segs
 from .thumbnails import get_thumbnail
 from .winrecycle import delete_to_recyclebin
 
@@ -61,8 +61,22 @@ def _full_meta(it: dict) -> dict:
     return meta
 
 
+def _family(source: str) -> str:
+    """来源统一归入三类：ComfyUI / WebUI / 无数据。
+
+    NovelAI、A1111、InvokeAI 等浏览器式 WebUI 都归为 webui；
+    ComfyUI 保持独立；无元数据与解析错误合并为 none。
+    """
+    if source == "comfyui":
+        return "comfyui"
+    if source in ("none", "error", ""):
+        return "none"
+    return "webui"
+
+
 def _summary(it: dict, favs: set, tag_map: dict) -> dict:
     meta = it["meta"]
+    source = meta.get("source", "none")
     return {
         "id": it["id"],
         "name": it["name"],
@@ -72,7 +86,8 @@ def _summary(it: dict, favs: set, tag_map: dict) -> dict:
         "size": it["size"],
         "w": meta.get("pxw", 0),
         "h": meta.get("pxh", 0),
-        "source": meta.get("source", "none"),
+        "source": source,
+        "family": _family(source),
         "tool": meta.get("tool", ""),
         "prompt": (meta.get("prompt") or "")[:160],
         "model": meta.get("params", {}).get("model", ""),
@@ -111,17 +126,33 @@ def api_del_root(path: str):
     return {"roots": store.roots()}
 
 
+def _under_dir(it: dict, dir_path: str, subfolders: bool = True) -> bool:
+    if not dir_path:
+        return True
+    try:
+        p = Path(it["path"])
+        d = Path(dir_path)
+        if subfolders:
+            return p.is_relative_to(d)
+        return _cpath(p.parent) == _cpath(d)
+    except (OSError, ValueError):
+        return False
+
+
 @app.get("/api/images")
 def api_images(
     q: str = "",
     source: str = "",
+    family: str = "",
     model: str = "",
     sampler: str = "",
     ratio: str = "",
     tag: str = "",
+    tags: str = "",
     fav: bool = False,
     root: str = "",
     dir: str = "",
+    subfolders: bool = True,
     sort: str = "time-desc",
 ):
     if not _items_list:
@@ -139,16 +170,37 @@ def api_images(
             for t in (part.strip() for part in q.replace("，", ",").split(","))
             if t
         ]
+    # 搜索范围：文件名 + 正负提示词 + 标签 + TAG 分格内容
+    rev_tags: dict = {}
+    if terms:
+        for name, ids in tag_map.items():
+            for fid in ids:
+                rev_tags.setdefault(fid, []).append(name)
+        tag_docs = store.all_tag_docs()
+    else:
+        tag_docs = {}
+    # 提示词胶囊多选：每个标签都须命中（AND），与侧栏单选标签叠加
+    want_tags = [t.strip() for t in tags.replace("，", ",").split(",") if t.strip()]
+    if tag and tag not in want_tags:
+        want_tags.append(tag)
     for it in _items_list:
         if terms:
             hay = unicodedata.normalize(
                 "NFKC",
-                it["name"] + " " + (it["meta"].get("prompt") or "") + " "
-                + (it["meta"].get("negative") or ""),
+                " ".join((
+                    it["name"],
+                    it["meta"].get("prompt") or "",
+                    it["meta"].get("negative") or "",
+                    " ".join(rev_tags.get(it["id"], ())),
+                    tag_docs.get(it["id"], ""),
+                )),
             ).lower()
             if not all(t in hay for t in terms):
                 continue
-        if source and it["meta"].get("source", "none") != source:
+        item_source = it["meta"].get("source", "none")
+        if source and item_source != source:
+            continue
+        if family and _family(item_source) != family:
             continue
         if model and it["meta"].get("params", {}).get("model", "") != model:
             continue
@@ -160,13 +212,13 @@ def api_images(
                 kind = "landscape" if w > h * 1.05 else ("portrait" if h > w * 1.05 else "square")
                 if kind != ratio:
                     continue
-        if tag and it["id"] not in tag_map.get(tag, []):
+        if want_tags and not all(it["id"] in tag_map.get(t, ()) for t in want_tags):
             continue
         if fav and it["id"] not in favs:
             continue
         if root and not Path(it["path"]).is_relative_to(Path(root)):
             continue
-        if dir and not Path(it["path"]).is_relative_to(Path(dir)):
+        if not _under_dir(it, dir, subfolders):
             continue
         items.append(_summary(it, favs, tag_map))
     # 过滤选项
@@ -183,6 +235,24 @@ def api_images(
     if sort_key in keymap:
         items.sort(key=keymap[sort_key], reverse=sort_dir != "asc")
     return {"total": len(items), "items": items, "models": models, "samplers": samplers}
+
+
+@app.get("/api/facets")
+def api_facets(dir: str = "", subfolders: bool = True):
+    """LIBRARY 分类计数：随当前文件夹变化，不受来源/标签/收藏过滤影响。"""
+    if not _items_list:
+        _refresh()
+    favs = store.favs()
+    counts = {"total": 0, "fav": 0, "comfyui": 0, "webui": 0, "none": 0}
+    for it in _items_list:
+        if not _under_dir(it, dir, subfolders):
+            continue
+        counts["total"] += 1
+        if it["id"] in favs:
+            counts["fav"] += 1
+        counts[_family(it["meta"].get("source", "none"))] += 1
+    return counts
+
 
 
 def _folder_tree(items: list) -> list:
@@ -278,6 +348,7 @@ def api_meta(fid: str):
     meta["fav"] = fid in store.favs()
     meta["tags"] = sorted(t for t, ids in store.all_tags().items() if fid in ids)
     meta["file"] = {"name": it["name"], "path": it["path"], "size": it["size"], "mtime": it["mtime"]}
+    meta["tagdoc"] = store.tag_doc(fid)
     return meta
 
 
@@ -344,6 +415,200 @@ def api_tags(body: TagsIn):
 @app.get("/api/tags")
 def api_all_tags():
     return {"tags": {k: len(v) for k, v in sorted(store.all_tags().items())}}
+
+
+class TagRenameIn(BaseModel):
+    old: str
+    new: str
+
+
+@app.delete("/api/tags")
+def api_delete_tag(name: str):
+    """删除一个标签（所有图片同步移除）。"""
+    n = store.delete_tag(name)
+    return {"ok": True, "removed": n}
+
+
+@app.post("/api/tags/rename")
+def api_rename_tag(body: TagRenameIn):
+    old, new = body.old.strip(), body.new.strip()
+    if not old or not new:
+        raise HTTPException(400, "标签名不能为空")
+    n = store.rename_tag(old, new)
+    return {"ok": True, "count": n}
+
+
+# ---------------- 重命名 ----------------
+
+class RenameIn(BaseModel):
+    name: str
+    path: str = ""   # 精确指定改哪一份：同一内容可能在多个根目录各有一份
+
+
+def _item_at(fid: str, path: str = "") -> dict:
+    """优先按路径定位条目。
+
+    fid 是内容指纹，两个目录里的同一张图会共用一个 fid；
+    涉及到改文件名的操作必须按路径精确命中，否则可能改错那一份。
+    """
+    if path:
+        want = _cpath(path)
+        if not _items_list:
+            _refresh()
+        for it in _items_list:
+            if it["id"] == fid and _cpath(it["path"]) == want:
+                return it
+    return _item(fid)
+
+
+@app.post("/api/rename/{fid}")
+def api_rename(fid: str, body: RenameIn):
+    """就地重命名文件（只改文件名，不移动目录）。
+
+    fid 是「文件大小 + 前 64KB 内容」的哈希，改名不会变，
+    所以收藏、标签、画板里对这张图的引用都保持有效。
+    """
+    import re
+
+    it = _item_at(fid, body.path)
+    src = Path(it["path"])
+    if not src.is_file():
+        raise HTTPException(404, "文件不存在（可能已被移动或删除）")
+    raw = (body.name or "").strip()
+    if not raw:
+        raise HTTPException(400, "文件名不能为空")
+    raw = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", raw).strip(" .")
+    if not raw:
+        raise HTTPException(400, "文件名不合法")
+    if not raw.lower().endswith(src.suffix.lower()):
+        raw += src.suffix
+    dest = src.with_name(raw)
+    if dest == src:
+        return {"ok": True, "name": src.name, "id": fid}
+    if dest.exists():
+        raise HTTPException(409, "同目录下已有同名文件")
+    try:
+        src.rename(dest)
+    except OSError as e:
+        raise HTTPException(400, f"重命名失败：{e}")
+    _refresh()
+    return {"ok": True, "name": dest.name, "id": fid_for(dest)}
+
+
+# ---------------- TAG 分格（可供 AI 直接接入的读写接口） ----------------
+# 一格 = 一个主体名 k + 一段自由文本 v。模板只存主体名骨架，方便套用。
+
+
+def merge_segs(cur: list, base: list) -> list:
+    """把骨架 base 套到已有的 cur 上。
+
+    按分格名对齐：同名的一格保留 cur 的内容（模板不带内容，不该覆盖），
+    骨架里多出来的名字补一格空壳；cur 里多出来的格子原样保留。
+    """
+    out = [dict(s) for s in cur]
+    have = {s["k"] for s in out if s["k"]}
+    for s in base:
+        k = s.get("k") or ""
+        if not k:
+            continue
+        if k in have:
+            continue
+        have.add(k)
+        out.append({"k": k, "v": ""})
+    return out
+
+
+class SegIn(BaseModel):
+    k: str = ""
+    v: str = ""
+
+
+class TagDocIn(BaseModel):
+    segs: list = []
+
+
+class TagDocBatchIn(BaseModel):
+    ids: list = []
+
+
+class TplIn(BaseModel):
+    name: str
+    segs: list = []
+
+
+class TagApplyIn(BaseModel):
+    ids: list = []
+    template: str = ""
+    segs: list = []
+    mode: str = "merge"     # merge：只补缺失的格子；replace：整份替换
+
+
+@app.get("/api/tagdoc/templates")
+def api_tag_templates():
+    return {"templates": store.templates()}
+
+
+@app.post("/api/tagdoc/templates")
+def api_tag_template_save(body: TplIn):
+    try:
+        return {"template": store.save_template(body.name, body.segs)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/api/tagdoc/templates")
+def api_tag_template_del(name: str):
+    store.delete_template(name)
+    return {"ok": True}
+
+
+@app.post("/api/tagdoc/batch")
+def api_tagdoc_batch(body: TagDocBatchIn):
+    """批量读：{"ids": [...]} → {"docs": {fid: [{k, v}]}}"""
+    fids = [str(x) for x in body.ids if x]
+    return {"docs": store.tag_docs(fids)}
+
+
+@app.post("/api/tagdoc/apply")
+def api_tagdoc_apply(body: TagApplyIn):
+    """把一份分格骨架（模板）套用到多张图片。
+
+    模板只有「有几格 + 每格叫什么」，没有内容，所以套用时：
+    - merge：目标图已有的格子连同内容原样保留，只补上缺的格子（内容留空）；
+    - replace：整份换成骨架，内容清空。
+    """
+    fids = [str(x) for x in body.ids if x]
+    if not fids:
+        raise HTTPException(400, "没有指定图片")
+    if body.template:
+        found = next((t for t in store.templates() if t["name"] == body.template), None)
+        if not found:
+            raise HTTPException(404, f"模板不存在：{body.template}")
+        base = found["segs"]
+    else:
+        base = clean_segs(body.segs)
+    if not base:
+        raise HTTPException(400, "分格为空")
+    saved = {}
+    for fid in fids:
+        if body.mode == "replace":
+            segs = [{"k": s["k"], "v": ""} for s in base]
+        else:
+            segs = merge_segs(store.tag_doc(fid), base)
+        saved[fid] = store.set_tag_doc(fid, segs)
+    return {"ok": True, "docs": saved}
+
+
+@app.get("/api/tagdoc/{fid}")
+def api_tagdoc_get(fid: str):
+    return {"id": fid, "segs": store.tag_doc(fid)}
+
+
+@app.put("/api/tagdoc/{fid}")
+@app.post("/api/tagdoc/{fid}")
+def api_tagdoc_set(fid: str, body: TagDocIn):
+    """整份写入某张图片的 TAG 分格（PUT / POST 等价，方便 AI 调用）。"""
+    return {"id": fid, "segs": store.set_tag_doc(fid, body.segs)}
 
 
 # ---------------- 导出 ----------------
