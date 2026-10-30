@@ -23,10 +23,10 @@
 <!-- 顶栏：命令栏，两套主题都是深色 -->
 <header id="topbar">
   <button id="nav-toggle" type="button" aria-label="侧栏 (N)" title="侧栏 (N)">☰</button>
-  <a class="brand" href="#" title="Texture">
+  <div class="brand" title="Texture">
     <span class="seal" aria-hidden="true">T</span>
     <span class="name">TEXTURE</span>
-  </a>
+  </div>
 
   <nav id="view-switch" aria-label="视图">
     <button type="button" data-view="grid" class="active" aria-current="page">图库<small>Library</small></button>
@@ -35,7 +35,7 @@
 
   <div class="search-wrap">
     <span class="search-ico" aria-hidden="true">⌕</span>
-    <input id="search" type="search" placeholder="文件名 / 标签 / 提示词，逗号＝同时包含" autocomplete="off" aria-label="搜索">
+    <input id="search" type="search" placeholder="文件名 / 标签 / 提示词" autocomplete="off" aria-label="搜索">
     <button id="search-clear" class="search-clear" type="button" title="清空搜索" hidden>✕</button>
   </div>
 
@@ -44,8 +44,8 @@
     <div class="tb-menu-wrap">
       <button id="btn-settings" class="icon-btn" type="button" title="设置">⚙</button>
       <div class="tb-menu align-right" id="settings-menu" hidden>
+        <button class="ctx-item" id="set-prefs" type="button">偏好设置…</button>
         <button class="ctx-item" id="set-theme" type="button">切换深浅</button>
-        <button class="ctx-item" id="set-shortcuts" type="button">键盘快捷键</button>
         <div class="ctx-sep"></div>
         <button class="ctx-item" id="set-rescan" type="button">重新扫描全部文件夹</button>
       </div>
@@ -115,7 +115,7 @@
 
       <div id="grid" class="grid masonry"></div>
       <div id="grid-empty" class="empty-hint" hidden>
-        <span id="grid-empty-text">图库是空的。点右上角「添加文件夹」，选一个存放生成图的目录，图片会出现在这里。</span>
+        <span id="grid-empty-text">图库为空</span>
         <button id="btn-clear-filter" class="btn primary" type="button" hidden>清除过滤条件</button>
       </div>
     </section>
@@ -127,6 +127,10 @@
         <button id="drawer-toggle" class="btn ghost" type="button"><i class="ic" data-ic="drag"></i> 素材</button>
 
         <span class="tb-sep" aria-hidden="true"></span>
+        <div class="undo-group" role="group" aria-label="撤销与重做">
+          <button id="board-undo" class="icon-btn" type="button" title="撤销 (Ctrl+Z)" disabled>↶</button>
+          <button id="board-redo" class="icon-btn" type="button" title="重做 (Ctrl+Shift+Z)" disabled>↷</button>
+        </div>
         <div class="zoom-group">
           <button id="zoom-out" class="icon-btn" type="button" title="缩小 (−)">−</button>
           <button id="zoom-level" class="zoom-level" type="button" title="回到 100%">100%</button>
@@ -172,24 +176,47 @@
       <div id="board-wrap">
         <div id="board-canvas"></div>
         <div id="sel-toolbar" hidden>
+          <span id="sel-count-node" hidden></span>
           <button id="sel-front" type="button" title="移到最前 (])">⬆</button>
           <button id="sel-back" type="button" title="移到最后 ([)">⬇</button>
           <button id="sel-dup" type="button" title="复制 (Ctrl+D)">⧉</button>
           <button id="sel-label" type="button" title="编辑连线标签" hidden>标签</button>
-          <button id="sel-style" type="button" title="颜色与文字排版">颜色</button>
+          <button id="sel-style" type="button" title="颜色、文字与连线样式">样式</button>
           <button id="sel-del" class="danger" type="button" title="删除 (Del)" aria-label="删除"><i class="ic" data-ic="ashbin"></i></button>
         </div>
         <div id="style-pop" hidden>
-          <div class="style-row">
-            <span class="style-label">节点颜色</span>
-            <span class="sel-colors" id="sel-colors"></span>
+          <div class="style-row for-edge">
+            <span class="style-label">走线</span>
+            <span class="style-align" id="style-route">
+              <button type="button" data-route="curve" title="贝塞尔曲线">曲线</button>
+              <button type="button" data-route="ortho" title="圆角直角">直角</button>
+              <button type="button" data-route="diag" title="45° 折角">折角</button>
+              <button type="button" data-route="line" title="直线">直线</button>
+            </span>
+          </div>
+          <div class="style-row for-edge">
+            <span class="style-label">箭头</span>
+            <span class="style-align" id="style-arrow">
+              <button type="button" data-arrow="end" title="只画末端箭头">末端</button>
+              <button type="button" data-arrow="both" title="两端都画">双向</button>
+              <button type="button" data-arrow="none" title="不画箭头">无</button>
+            </span>
+            <span class="style-label inline">线型</span>
+            <span class="style-align" id="style-dash">
+              <button type="button" data-dash="0" title="实线">实线</button>
+              <button type="button" data-dash="1" title="虚线">虚线</button>
+            </span>
           </div>
           <div class="style-row">
+            <span class="style-label">颜色</span>
+            <span class="sel-colors" id="sel-colors"></span>
+          </div>
+          <div class="style-row for-node">
             <span class="style-label">文字颜色</span>
             <input id="style-text-color" type="color" value="#161616" aria-label="文字颜色">
             <button id="style-text-default" class="style-mini" type="button">恢复默认</button>
           </div>
-          <div class="style-row">
+          <div class="style-row for-node">
             <span class="style-label">字号</span>
             <select id="style-font-size" aria-label="字号">
               <option value="">默认</option>
@@ -207,7 +234,7 @@
               <option value="mono">等宽</option>
             </select>
           </div>
-          <div class="style-row">
+          <div class="style-row for-node">
             <span class="style-label">对齐</span>
             <span class="style-align" id="style-align">
               <button type="button" data-align="left" title="左对齐">左</button>
@@ -222,7 +249,7 @@
               <option value="1.9">宽松</option>
             </select>
           </div>
-          <button id="style-reset" class="style-reset" type="button">重置本节点排版</button>
+          <button id="style-reset" class="style-reset for-node" type="button">重置本节点排版</button>
         </div>
 
         <!-- 底部固定创建栏：文本 / 组 / Markdown / 链接 -->
@@ -239,15 +266,13 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8V5h3M17 5h3v3M20 16v3h-3M7 19H4v-3"/><rect x="8" y="8" width="8" height="8"/></svg>
             <span>组</span>
           </button>
-          <button type="button" data-add="link" title="新建链接卡片">
+          <button type="button" data-add="link" title="新建链接卡片（[名称](链接地址)）">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1"/></svg>
             <span>链接</span>
           </button>
         </div>
 
-        <div id="board-hint" class="board-hint">
-          框选拖动 · 空格平移 · 滚轮缩放 · 拖外轮廓改大小 · 菱形拉连线 · 缺角＝固定 · 双击看大图
-        </div>
+        <div id="board-hint" class="board-hint" hidden></div>
       </div>
     </section>
 
@@ -272,7 +297,20 @@
              spellcheck="false" autocomplete="off" aria-label="图片名称">
     </div>
     <div class="insp-preview"><img id="insp-thumb" alt=""></div>
-    <div id="insp-empty">点左侧任意图片，这里显示它的提示词与参数。</div>
+    <div id="insp-empty">未选择图片</div>
+    <div id="insp-private" class="insp-private" hidden>
+      <p class="ip-eyebrow">Private</p>
+      <p class="ip-text">内容已隐藏</p>
+    </div>
+
+    <!-- 画布多选：不单独编辑某一个节点，只报数量 + 能做什么 -->
+    <div id="insp-multi" hidden>
+      <div class="insp-node-meta">
+        <span class="insp-node-kind">多选</span>
+        <span id="insp-multi-count" class="field"></span>
+      </div>
+      <p class="insp-multi-hint">拖动任意一个即整组移动；方向键微调、Del 删除，上方工具条可插入、复制、改样式。</p>
+    </div>
 
     <!-- 画布节点：文字 / Markdown / 组 / 链接的查看与编辑 -->
     <div id="insp-board-node" hidden>
@@ -282,7 +320,6 @@
       </div>
       <label id="insp-node-label" for="insp-node-text">内容</label>
       <textarea id="insp-node-text" spellcheck="false" placeholder="在这里输入内容…"></textarea>
-      <div id="insp-node-hint" class="insp-node-hint">修改会实时同步到画布，并自动保存。</div>
       <div class="insp-node-actions">
         <button id="insp-node-dup" class="btn mini ghost" type="button">复制节点</button>
         <button id="insp-node-del" class="btn mini danger" type="button">删除节点</button>
@@ -347,8 +384,7 @@
               <button id="tag-del-tpl" class="btn mini ghost" type="button" title="删除选中的模板">删模板</button>
             </div>
             <div id="tag-segs" class="tag-segs"></div>
-            <p id="tag-empty" class="tag-empty">还没有胶囊。先挑一个模板「应用」，或点「＋ 胶囊」自己起一格。</p>
-            <p class="tag-hint">每一格 = 一个主体名 + 一段内容（内容按逗号切成词框，点词框可筛选）。改完自动保存。</p>
+            <p id="tag-empty" class="tag-empty">无内容</p>
           </div>
         </section>
 
@@ -379,6 +415,7 @@
 <!-- 多选批量操作条 -->
 <div id="selection-bar" hidden>
   <span id="sel-count" class="field"></span>
+  <button id="bsel-to-board" class="btn mini" type="button">放入画板</button>
   <button id="bsel-fav" class="btn mini" type="button">★ 收藏</button>
   <button id="bsel-tag" class="btn mini" type="button"><i class="ic" data-ic="attach"></i> 标签</button>
   <button id="bsel-del" class="btn mini danger" type="button"><i class="ic" data-ic="ashbin"></i> 移入回收站</button>
@@ -391,16 +428,140 @@
 <!-- 隐藏的文件选择器：导入 .canvas -->
 <input type="file" id="canvas-file" accept=".canvas,.json,application/json" hidden>
 
-<!-- 快捷键面板（? 呼出，全部可改键） -->
-<div id="shortcuts" hidden>
-  <div class="sc-mask"></div>
-  <div class="sc-box">
-    <div class="sc-head">Keyboard / 快捷键</div>
-    <p class="hk-hint">点右侧键位按钮 → 按下新的组合键即完成改键（Esc 取消）；↺ 恢复该项默认。画板相关仅在画板视图生效。</p>
-    <div id="hk-list"></div>
-    <div class="hk-foot">
-      <button id="hk-reset-all" class="btn mini ghost" type="button">全部恢复默认</button>
-      <span class="field">固定键位：Esc 关闭/取消 · ←→ 翻页/移动 · 方向键微调 · 空格拖动平移 · 滚轮缩放</span>
+<!-- 偏好设置（? 不再弹面板，改为聚焦顶部搜索栏） -->
+<div id="prefs" hidden>
+  <div class="pf-mask"></div>
+  <div class="pf-box" role="dialog" aria-modal="true" aria-labelledby="pf-title">
+    <div class="pf-head">
+      <span id="pf-title" class="pf-eyebrow">Preferences / 偏好设置</span>
+      <button id="pf-close" class="pf-x" type="button" title="关闭 (Esc)" aria-label="关闭">✕</button>
+    </div>
+    <div class="pf-body">
+      <section class="pf-sec">
+        <h3 class="pf-h">外观</h3>
+        <div class="pf-row">
+          <span class="pf-label">主题</span>
+          <div class="seg text" id="pf-theme">
+            <button type="button" data-theme="light">浅色</button>
+            <button type="button" data-theme="dark">深色</button>
+          </div>
+          <span class="pf-note">会自动记住，下次打开保持</span>
+        </div>
+      </section>
+
+      <section class="pf-sec">
+        <h3 class="pf-h">字体与字号</h3>
+        <div class="pf-row">
+          <span class="pf-label">字号</span>
+          <input id="pf-ui-size" type="number" min="12" max="20" step="1" value="16">
+          <span class="pf-note">px</span>
+        </div>
+        <div class="pf-row">
+          <span class="pf-label">字体</span>
+          <div class="seg text" id="pf-board-font">
+            <button type="button" data-board-font="sans">无衬线</button>
+            <button type="button" data-board-font="serif">衬线</button>
+            <button type="button" data-board-font="mono">等宽</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="pf-sec">
+        <h3 class="pf-h">搜索</h3>
+        <p class="pf-note">普通词直接搜，空格分隔＝同时包含；用 <code>/…/</code> 包住的部分按正则匹配，可以和普通词混用。</p>
+        <p class="pf-note">例：<code>girl /^img_\d{4}\.png$/</code> —— 含 <em>girl</em>，且文件名形如 <em>img_0001.png</em></p>
+      </section>
+
+      <section class="pf-sec">
+        <h3 class="pf-h">撤销 / 重做</h3>
+        <div class="pf-row">
+          <span class="pf-label">保留步数</span>
+          <input id="pf-undo" type="number" min="5" max="500" step="5" value="50">
+          <span class="pf-note">5–500，超出后丢最旧的</span>
+        </div>
+      </section>
+
+      <section class="pf-sec">
+        <h3 class="pf-h">键盘快捷键</h3>
+        <p class="pf-note">点键位按钮，按下新组合键即完成改键；↺ 恢复该项默认</p>
+        <div id="hk-list"></div>
+        <div class="pf-row pf-row-end">
+          <button id="hk-reset-all" class="btn mini ghost" type="button">全部恢复默认</button>
+        </div>
+      </section>
+
+      <section class="pf-sec">
+        <h3 class="pf-h">文件管理</h3>
+        <div class="pf-row">
+          <span class="pf-label">内置图片位置</span>
+          <input id="pf-image-dir" class="pf-input" spellcheck="false" autocomplete="off">
+          <button id="pf-pick-image" class="btn mini ghost" type="button">选择…</button>
+        </div>
+        <p class="pf-note">导入模式把图片复制到这里；留空＝data/library</p>
+        <div class="pf-row">
+          <span class="pf-label">数据位置</span>
+          <input id="pf-data-dir" class="pf-input" spellcheck="false" autocomplete="off">
+          <button id="pf-apply-data" class="btn mini" type="button">迁移…</button>
+        </div>
+        <p class="pf-note">数据库与缩略图位置，迁移后重启生效</p>
+      </section>
+
+      <section class="pf-sec">
+        <h3 class="pf-h">隐私</h3>
+        <div class="pf-row">
+          <span class="pf-label">隐私模式</span>
+          <label class="pf-switch">
+            <input id="pf-privacy" type="checkbox">
+            <span aria-hidden="true"></span>
+          </label>
+          <span id="pf-privacy-state" class="pf-note"></span>
+        </div>
+        <div id="pf-private-list" class="pf-private"></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<!-- 添加文件夹：先选方式，再填一个或多个路径 -->
+<div id="add-root" hidden>
+  <div class="ar-mask"></div>
+  <div class="ar-box" role="dialog" aria-modal="true" aria-labelledby="ar-title">
+    <div class="ar-head">
+      <span id="ar-title" class="pf-eyebrow">Sources / 添加文件夹</span>
+      <button id="ar-close" class="pf-x" type="button" title="关闭 (Esc)" aria-label="关闭">✕</button>
+    </div>
+    <div class="ar-body">
+      <div class="ar-modes" role="radiogroup" aria-label="添加方式">
+        <button type="button" class="ar-mode active" data-mode="read" role="radio" aria-checked="true">
+          <span class="am-en">Read only</span>
+          <span class="am-zh">只读取</span>
+          <span class="am-desc">原地登记，不动原文件</span>
+        </button>
+        <button type="button" class="ar-mode" data-mode="import" role="radio" aria-checked="false">
+          <span class="am-en">Copy &amp; clear</span>
+          <span class="am-zh">复制后清空原文</span>
+          <span class="am-desc">复制进内置位置，原件移入回收站</span>
+        </button>
+      </div>
+
+      <div class="ar-paths">
+        <div class="ar-row">
+          <span class="ar-label">路径</span>
+          <textarea id="ar-paths" class="ar-batch" rows="3" spellcheck="false"
+                    placeholder='"D:\ComfyUI\output" "E:\SD\outputs"'></textarea>
+        </div>
+        <div class="ar-row ar-row-ops">
+          <button id="ar-browse" class="btn mini ghost" type="button">浏览…</button>
+          <span id="ar-count" class="field"></span>
+        </div>
+      </div>
+
+      <p id="ar-warn" class="ar-warn" hidden></p>
+
+      <div class="ar-foot">
+        <button id="ar-cancel" class="btn mini ghost" type="button">取消</button>
+        <button id="ar-ok" class="btn primary" type="button">添加</button>
+      </div>
     </div>
   </div>
 </div>

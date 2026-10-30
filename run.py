@@ -16,6 +16,7 @@
 是其他程序 → 打印明确提示并退出，不会误杀。
 """
 import argparse
+import os
 import socket
 import subprocess
 import sys
@@ -146,13 +147,21 @@ class NativeApi:
 
 def run_native(host: str, port: int, debug: bool):
     import webview
+
+    from app.settings import DATA_DIR
+
     server = start_server(host, port, "info" if debug else "warning")
     webview.create_window(
         "Texture", f"http://{LOCAL}:{port}",
         js_api=NativeApi(), width=1400, height=900, min_size=(960, 640),
     )
     try:
-        webview.start(debug=debug)  # 阻塞至窗口关闭
+        # private_mode=False + 固定的 storage_path：WebView2 才会把 localStorage
+        # 落到磁盘上。默认的隐私模式每次都用临时配置目录，主题、布局等记忆
+        # 一关就全没了（表现为「选了深色，下次打开又是亮色」）。
+        profile = os.path.join(str(DATA_DIR), "webview")
+        os.makedirs(profile, exist_ok=True)
+        webview.start(debug=debug, private_mode=False, storage_path=profile)
     finally:
         server.should_exit = True
         time.sleep(0.2)

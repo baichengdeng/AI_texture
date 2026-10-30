@@ -29,6 +29,7 @@ const state = {
 };
 
 const metaCache = new Map();
+let lastRegexError = "";
 
 async function api(path, opts = {}) {
   if (opts.body && typeof opts.body === "object") {
@@ -86,6 +87,336 @@ async function copyText(text, btn) {
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
   try { localStorage.setItem("texture.theme", theme); } catch { /* ignore */ }
+  document.querySelectorAll("#pf-theme button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.theme === theme));
+}
+
+/* ---------------- 字体与字号：字号是整屏的，字体是画布的 ---------------- */
+const BOARD_FONTS = {
+  sans: { name: "无衬线", css: "var(--font-text)" },
+  serif: { name: "衬线", css: '"Songti SC", "SimSun", "Noto Serif SC", serif' },
+  mono: { name: "等宽", css: "var(--font-mono)" },
+};
+const UI_MIN = 12, UI_MAX = 20, UI_DEFAULT = 16;
+const boardText = {
+  font: BOARD_FONTS[localStorage.getItem("texture.boardFont")] ? localStorage.getItem("texture.boardFont") : "sans",
+  // 字号是整屏基准：直接改根节点 font-size，界面里所有 rem 尺寸按比例一起走
+  size: Math.min(UI_MAX, Math.max(UI_MIN, Number(localStorage.getItem("texture.uiSize")) || UI_DEFAULT)),
+};
+
+/* 只落到两处：根节点 font-size（全站 rem 缩放）与 --board-font（画布字体）。
+   画布字号由 CSS 从 --ui-fs 派生，所以这里不用再写死像素 */
+function applyBoardText() {
+  const f = BOARD_FONTS[boardText.font] || BOARD_FONTS.sans;
+  const root = document.documentElement;
+  root.style.setProperty("--ui-fs", boardText.size + "px");
+  root.style.setProperty("--board-font", f.css);
+  try {
+    localStorage.setItem("texture.boardFont", boardText.font);
+    localStorage.setItem("texture.uiSize", String(boardText.size));
+  } catch { /* ignore */ }
+  document.querySelectorAll("#pf-board-font button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.boardFont === boardText.font));
+  // 画布那边要重新量一遍连线标签的文字框（框尺寸跟着字号走）
+  window.dispatchEvent(new CustomEvent("texture:boardtext"));
+}
+// 脚本在 body 末尾，这里立刻套用一次，避免先按 16px 画一帧再跳过去
+applyBoardText();
+
+/* ---------------- 服务端偏好（文件管理 / 撤销步数 / 隐私） ---------------- */
+const prefs = {
+  undo_limit: 50,
+  image_dir: "",
+  data_dir: "",
+  privacy: { on: false, items: [], dirs: [], count: 0 },
+};
+
+/* 给 board.js 等模块读的一份快照，避免它们各自再请求接口 */
+function syncPrefsGlobal() {
+  window.TEXTURE_SETTINGS = {
+    undoLimit: Number(prefs.undo_limit) || 50,
+    privacyOn: !!prefs.privacy.on,
+  };
+  window.dispatchEvent(new CustomEvent("texture:prefs", { detail: { ...prefs } }));
+}
+
+async function loadPrefs() {
+  try {
+    const s = await api("/api/settings");
+    Object.assign(prefs, s);
+    if (!prefs.privacy) prefs.privacy = { on: false, items: [], dirs: [], count: 0 };
+  } catch { /* 老后端没有这个接口：保持默认值 */ }
+  syncPrefsGlobal();
+}
+
+async function savePrefs(patch) {
+  try {
+    const s = await api("/api/settings", { method: "POST", body: patch });
+    Object.assign(prefs, s);
+    syncPrefsGlobal();
+    return true;
+  } catch (e) {
+    toast("保存失败：" + String(e.message || e).slice(0, 80));
+    return false;
+  }
+}
+
+/* ---------------- 隐私模式 ---------------- */
+async function refreshPrivacy() {
+  try {
+    prefs.privacy = await api("/api/privacy");
+  } catch { /* ignore */ }
+  const on = !!prefs.privacy.on;
+  const n = prefs.privacy.count || 0;
+  const sw = $("#pf-privacy");
+  if (sw) sw.checked = on;
+  const st = $("#pf-privacy-state");
+  if (st) st.textContent = on ? "已开启，隐私内容可见" : (n ? `已关闭，隐藏 ${n} 项` : "已关闭");
+  renderPrivateList();
+  syncPrefsGlobal();
+}
+
+function renderPrivateList() {
+  const host = $("#pf-private-list");
+  if (!host) return;
+  const { items = [], dirs = [] } = prefs.privacy;
+  host.innerHTML = "";
+  if (!items.length && !dirs.length) return;   // 空的时候什么都不显示
+  const row = (label, sub, onRemove) => {
+    const d = document.createElement("div");
+    d.className = "pv-row";
+    d.innerHTML = `<b>${esc(label)}</b><span class="pv-path">${esc(sub || "")}</span>`;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn mini ghost";
+    b.textContent = "取消隐私";
+    b.addEventListener("click", onRemove);
+    d.appendChild(b);
+    host.appendChild(d);
+    return d;
+  };
+  for (const p of dirs) {
+    row("文件夹", p, async () => {
+      await markPrivate({ path: p, private: false });
+    });
+  }
+  for (const it of items) {
+    row(it.name || it.id, it.dir, async () => {
+      await markPrivate({ fid: it.id, private: false });
+    });
+  }
+}
+
+async function markPrivate({ fid = "", path = "", private: isPrivate }) {
+  try {
+    prefs.privacy = await api("/api/privacy/mark", {
+      method: "POST", body: { fid, path, private: isPrivate },
+    });
+  } catch (e) {
+    toast("操作失败：" + String(e.message || e).slice(0, 80));
+    return;
+  }
+  await refreshPrivacy();
+  await loadImages();
+  loadSidebar();
+  await syncPrivacyViews();
+  toast(isPrivate ? "已标记为隐私" : "已取消隐私标记");
+}
+
+async function togglePrivacy(on) {
+  try {
+    prefs.privacy = await api("/api/privacy/mode", { method: "POST", body: { on } });
+  } catch (e) {
+    toast("切换失败：" + String(e.message || e).slice(0, 80));
+    return;
+  }
+  await refreshPrivacy();
+  await loadImages();
+  loadSidebar();
+  await syncPrivacyViews();
+  toast(on ? "隐私模式已开启" : "隐私模式已关闭");
+}
+
+/* 隐私状态一变，信息栏与画板都可能还停在旧内容上：缓存清掉、选中项回空、画板重取 */
+async function syncPrivacyViews() {
+  metaCache.clear();
+  if (state.selected && isPrivateFid(state.selected)) {
+    state.selected = null;
+    restoreGalleryInspector();
+  }
+  if (typeof window.boardApplyPrivacy === "function") await window.boardApplyPrivacy();
+}
+
+/* 只知道指纹时，判断它是不是当前看不见的隐私项（文件夹级的由后端负责） */
+function isPrivateFid(fid) {
+  if (!fid || prefs.privacy.on) return false;
+  const list = prefs.privacy.items || [];
+  return list.some((x) => x.id === fid);
+}
+
+function showPrivateInspector() {
+  hideBoardNodeEditor();
+  state.selected = null;
+  currentMeta = null;
+  $("#insp-empty").hidden = true;
+  $("#insp-body").hidden = true;
+  const node = $("#insp-board-node");
+  if (node) node.hidden = true;
+  const pv = $("#insp-private");
+  if (pv) pv.hidden = false;
+  $("#insp-thumb").removeAttribute("src");
+  $("#insp-thumb").parentElement.classList.remove("has-img");
+  setInspName("—");
+}
+
+function hidePrivateInspector() {
+  const pv = $("#insp-private");
+  if (pv) pv.hidden = true;
+}
+
+/* 顶部搜索栏：? 直接聚焦并全选，不再弹面板 */
+function focusSearch() {
+  if ($("#view-board") && !$("#view-board").hidden) switchView("grid");
+  const box = $("#search");
+  if (!box) return;
+  box.focus();
+  box.select();
+}
+
+/* ---------------- 偏好设置面板 ---------------- */
+function fillPrefs() {
+  const theme = document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+  document.querySelectorAll("#pf-theme button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.theme === theme));
+  const undo = $("#pf-undo");
+  if (undo) undo.value = prefs.undo_limit;
+  const img = $("#pf-image-dir");
+  if (img) img.value = prefs.image_dir || "";
+  const data = $("#pf-data-dir");
+  if (data) data.value = prefs.data_dir || "";
+  const sw = $("#pf-privacy");
+  if (sw) sw.checked = !!prefs.privacy.on;
+  const st = $("#pf-privacy-state");
+  if (st) {
+    const n = prefs.privacy.count || 0;
+    st.textContent = prefs.privacy.on ? "已开启，隐私内容可见"
+      : n ? `已关闭，隐藏 ${n} 项` : "已关闭";
+  }
+  renderPrivateList();
+  Hotkeys.renderPanel();
+  applyBoardText();
+}
+
+function openPrefs() {
+  const el = $("#prefs");
+  if (!el) return;
+  el.hidden = false;
+  fillPrefs();
+  setTimeout(() => $("#pf-close")?.focus(), 20);
+}
+
+function closePrefs() {
+  const el = $("#prefs");
+  if (el) el.hidden = true;
+}
+
+/* ---------------- 添加文件夹面板 ---------------- */
+let addRootMode = "read";
+
+/* 一串路径：优先取被引号包住的部分（"D:\a" "E:\b"），没有引号就按行拆 */
+function parsePathList(text) {
+  const raw = String(text || "");
+  const clean = (p) => {
+    let s = String(p || "").trim().replace(/^["'“”]+|["'“”]+$/g, "");
+    if (/^[a-zA-Z]:[\\/]?$/.test(s)) return s;        // 盘符根目录原样保留
+    return s.replace(/[\\/]+$/, "");
+  };
+  let list = [...raw.matchAll(/["“]([^"”]+)["”]/g)].map((m) => m[1]);
+  if (!list.length) list = raw.split(/[\r\n]+/);
+  const out = [], seen = new Set();
+  for (const raw2 of list) {
+    const p = clean(raw2);
+    if (!p || seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
+  }
+  return out;
+}
+
+function syncAddRoot() {
+  const list = parsePathList($("#ar-paths").value);
+  $("#ar-count").textContent = list.length ? `${list.length} 个路径` : "";
+  const warn = $("#ar-warn");
+  if (addRootMode === "import") {
+    warn.hidden = false;
+    warn.textContent = `原件会被移入回收站 · 复制到 ${prefs.image_dir || "内置图片位置"}`;
+  } else {
+    warn.hidden = true;
+  }
+  $("#ar-ok").disabled = !list.length;
+}
+
+function openAddRoot() {
+  addRootMode = "read";
+  document.querySelectorAll("#add-root .ar-mode").forEach((b) => {
+    const on = b.dataset.mode === addRootMode;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-checked", String(on));
+  });
+  $("#ar-paths").value = "";
+  const el = $("#add-root");
+  el.hidden = false;
+  syncAddRoot();
+  setTimeout(() => $("#ar-paths").focus(), 20);
+}
+
+function closeAddRoot() {
+  const el = $("#add-root");
+  if (el) el.hidden = true;
+}
+
+async function submitAddRoot() {
+  const paths = parsePathList($("#ar-paths").value);
+  if (!paths.length) { toast("没有识别到路径"); return; }
+  if (addRootMode === "import") {
+    const ok = await appConfirm(
+      `将把 ${paths.length} 个文件夹里的图片复制到：\n${prefs.image_dir || "内置图片位置"}\n\n` +
+      "逐个校验大小后，把原件移入系统回收站。\n\n确实要继续吗？");
+    if (!ok) return;
+  }
+  const okBtn = $("#ar-ok");
+  const label = okBtn.textContent;
+  okBtn.disabled = true;
+  okBtn.textContent = "添加中…";
+  let res;
+  try {
+    res = await api("/api/roots/batch", {
+      method: "POST", body: { paths, mode: addRootMode },
+    });
+  } catch (e) {
+    okBtn.disabled = false;
+    okBtn.textContent = label;
+    appAlert("添加失败：" + String(e.message || e).slice(0, 200));
+    return;
+  }
+  okBtn.disabled = false;
+  okBtn.textContent = label;
+  closeAddRoot();
+  await loadImages(); loadSidebar(); loadFolders();
+  const added = res.added || [], skipped = res.skipped || [];
+  const copied = added.reduce((n, x) => n + (x.copied || 0), 0);
+  if (addRootMode === "import") {
+    toast(`导入 ${added.length} 个文件夹 · ${copied} 张图` +
+      (skipped.length ? ` · 跳过 ${skipped.length}` : ""));
+  } else {
+    toast(`已添加 ${added.length} 个文件夹` +
+      (skipped.length ? ` · 跳过 ${skipped.length}` : ""));
+  }
+  if (skipped.length) {
+    const lines = skipped.slice(0, 6).map((s) => `${s.path}\n  ${s.reason}`).join("\n");
+    appAlert(`以下路径没有添加：\n\n${lines}` +
+      (skipped.length > 6 ? `\n\n…还有 ${skipped.length - 6} 个` : ""));
+  }
 }
 
 /* ---------------- 图库加载与过滤 ---------------- */
@@ -104,6 +435,13 @@ async function loadImages() {
   if (!$("#lightbox").hidden) closeLightbox();
   const data = await api("/api/images?" + qs);
   state.items = data.items;
+  // 正则写错时后端按字面量搜，并把错误带回来提示一次
+  if (data.regexError && data.regexError !== lastRegexError) {
+    lastRegexError = data.regexError;
+    toast("正则有误，已按普通文字搜索：" + String(data.regexError).slice(0, 60));
+  } else if (!data.regexError) {
+    lastRegexError = "";
+  }
   renderGrid();
   updateGridInfo();
   renderLibList();
@@ -176,6 +514,7 @@ function onCellClick(ev, it, idx) {
   if (ev.ctrlKey || ev.metaKey) {
     state.selection.has(it.id) ? state.selection.delete(it.id) : state.selection.add(it.id);
     state.anchorIdx = idx;
+    state.anchorId = it.id;          // 抽屉里的 Shift 连选共用这个锚点
     pickCell(it.id);
     syncSelectionBar();
     selectImage(it.id);
@@ -190,24 +529,58 @@ function onCellClick(ev, it, idx) {
     selectImage(it.id);
     return;
   }
-  if (state.selection.size) {
-    state.selection.clear();
-    document.querySelectorAll(".cell.picked").forEach((c) => c.classList.remove("picked"));
-    syncSelectionBar();
-  }
+  clearGallerySelection();
   state.anchorIdx = idx;
+  state.anchorId = it.id;
   selectImage(it.id);
 }
 
 function pickCell(id) {
-  const cell = document.querySelector(`.cell[data-id="${id}"]`);
-  if (cell) cell.classList.toggle("picked", state.selection.has(id));
+  // 同一张图可能同时出现在图库和素材抽屉里：两处一起点亮
+  document.querySelectorAll(`.cell[data-id="${id}"]`).forEach((c) =>
+    c.classList.toggle("picked", state.selection.has(id)));
 }
+
+/* 素材抽屉（画板左侧）走的是这一份：和图库共用同一个 selection，
+   Ctrl/Cmd 点切换、Shift 点连选、普通点单选——多选跨视图、跨列表都还在。 */
+function pickAsset(ev, it, cell) {
+  if (ev.ctrlKey || ev.metaKey) {
+    state.selection.has(it.id) ? state.selection.delete(it.id) : state.selection.add(it.id);
+    state.anchorId = it.id;
+  } else if (ev.shiftKey && state.anchorId) {
+    const cells = [...(cell.parentElement?.children || [])].filter((c) => c.classList.contains("cell"));
+    const a = cells.findIndex((c) => c.dataset.id === state.anchorId);
+    const b = cells.findIndex((c) => c === cell);
+    if (a >= 0 && b >= 0) {
+      const [s, e] = a < b ? [a, b] : [b, a];
+      state.selection = new Set(cells.slice(s, e + 1).map((c) => c.dataset.id));
+    } else {
+      state.selection = new Set([it.id]);
+    }
+    state.anchorId = it.id;
+  } else {
+    state.selection = new Set([it.id]);
+    state.anchorId = it.id;
+  }
+  document.querySelectorAll(".cell").forEach((c) =>
+    c.classList.toggle("picked", state.selection.has(c.dataset.id)));
+  syncSelectionBar();
+  selectImage(it.id);
+}
+window.pickAsset = pickAsset;
 
 function syncSelectionBar() {
   const bar = $("#selection-bar");
   bar.hidden = state.selection.size === 0;
   $("#sel-count").textContent = `已选 ${state.selection.size} 张`;
+}
+
+/* 清空图库多选：离开图库、点空白、按「取消选择」都走这里 */
+function clearGallerySelection() {
+  if (!state.selection.size) return;
+  state.selection.clear();
+  document.querySelectorAll(".cell.picked").forEach((c) => c.classList.remove("picked"));
+  syncSelectionBar();
 }
 
 async function batchFav() {
@@ -299,6 +672,11 @@ async function openCtxMenu(ev, it) {
   if (single) add('<i class="ic" data-ic="enter"></i> 打开原图', () => window.open("/api/file/" + it.id, "_blank"));
   add('<i class="ic" data-ic="locate"></i> 在资源管理器中显示', () => fetch("/api/reveal/" + it.id).then(() => {}));
   if (single) add("复制文件路径", () => copyText(meta.file?.path || it.path));
+  if (single) {
+    const isPrivate = (prefs.privacy.items || []).some((x) => x.id === it.id);
+    add(isPrivate ? "取消隐私标记" : "设为隐私（普通模式隐藏）",
+      () => markPrivate({ fid: it.id, private: !isPrivate }));
+  }
   add("加入当前画板", async () => {
     const ok = await addSelectionToBoard();
     if (ok) toast(`已加入画板（${ok} 张）`);
@@ -313,8 +691,7 @@ async function openCtxMenu(ev, it) {
 }
 document.addEventListener("click", (ev) => {
   if (!ev.target.closest("#ctx-menu")) closeCtxMenu();
-  if (!$("#shortcuts").hidden && !ev.target.closest("#shortcuts .sc-box")
-      && !ev.target.closest("#topbar")) $("#shortcuts").hidden = true;
+  // 偏好设置只认遮罩与关闭按钮，避免点里面输入框时误关
 });
 window.addEventListener("blur", closeCtxMenu);
 
@@ -397,7 +774,6 @@ function createAssetCell(it, opts = {}) {
     <img data-src="/api/thumb/${it.id}?s=256" alt="" loading="lazy" decoding="async" draggable="false">
     <span class="badge src-${it.family || it.source}">${familyLabel}</span>
     <span class="star">★</span>
-    ${index != null ? `<span class="no">${String(index + 1).padStart(3, "0")}</span>` : ""}
     <span class="tags">${(it.tags || []).slice(0, 3).map((t) => `<span>${esc(t)}</span>`).join("")}</span>`;
   if (onClick) cell.addEventListener("click", (ev) => onClick(ev, cell));
   if (onDblClick) cell.addEventListener("dblclick", () => onDblClick(it));
@@ -410,8 +786,11 @@ function createAssetCell(it, opts = {}) {
     }
   });
   cell.addEventListener("dragstart", (ev) => {
+    // 拖的这张在多选里，就把整批一起带走；否则只带这一张
+    const ids = state.selection.has(it.id) && state.selection.size > 1
+      ? [...state.selection] : [it.id];
     ev.dataTransfer.setData("text/texture-id", it.id);
-    ev.dataTransfer.setData("text/texture-name", it.name);
+    ev.dataTransfer.setData("text/texture-ids", JSON.stringify(ids));
     ev.dataTransfer.effectAllowed = "copy";
   });
   imgIO.observe(cell.querySelector("img"));
@@ -448,8 +827,8 @@ function renderGrid() {
   $("#grid-empty").hidden = !empty;
   if (empty) {
     $("#grid-empty-text").textContent = filterActive()
-      ? "没有匹配的图片。试试放宽或清除过滤条件。"
-      : "图库是空的。点击右上角「添加文件夹」，选择存放 AI 生成图片的文件夹后，图片会出现在这里。";
+      ? "没有匹配结果"
+      : "图库为空";
     $("#btn-clear-filter").hidden = !filterActive();
   }
   updateGridInfo();
@@ -565,6 +944,11 @@ function renderFolderTree() {
         loadImages().then(loadFacets);
         if (!navPinned()) setNav(false);
       });
+      row.addEventListener("contextmenu", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        openFolderMenu(ev, node, isRoot);
+      });
       const twisty = row.querySelector(".twisty");
       twisty.addEventListener("click", (ev) => {
         ev.stopPropagation();
@@ -672,7 +1056,7 @@ function openTagMenu(ev, name) {
   const add = (label, fn, cls = "") => {
     const d = document.createElement("div");
     d.className = "ctx-item " + cls;
-    d.textContent = label;
+    d.innerHTML = label;   // 标签里带 <i class="ic"> 图标，写成文本会原样显示一串 HTML
     d.onclick = async () => {
       closeCtxMenu();
       await fn();
@@ -710,6 +1094,45 @@ function openTagMenu(ev, name) {
   menu.style.top = Math.min(ev.clientY, innerHeight - mh - 8) + "px";
 }
 
+/* 文件夹右键：隐私标记 / 只看这个目录 / 移除根目录 */
+function openFolderMenu(ev, node, isRoot) {
+  const menu = $("#ctx-menu");
+  menu.innerHTML = "";
+  const add = (label, fn, cls = "") => {
+    const d = document.createElement("div");
+    d.className = "ctx-item " + cls;
+    d.textContent = label;
+    d.onclick = async () => { closeCtxMenu(); await fn(); };
+    menu.appendChild(d);
+  };
+  const priv = (prefs.privacy.dirs || []).some((p) => samePath(p, node.path));
+  add(priv ? "取消隐私标记" : "设为隐私文件夹（普通模式隐藏）",
+    () => markPrivate({ path: node.path, private: !priv }));
+  menu.insertAdjacentHTML("beforeend", '<div class="ctx-sep"></div>');
+  add("只看这个文件夹", () => {
+    state.filter.dir = node.path;
+    syncFolderActive();
+    loadImages().then(loadFacets);
+  });
+  if (isRoot) {
+    add("从图库移除（不删文件）", async () => {
+      if (!(await appConfirm(`从图库移除该文件夹？（不会删除文件）\n${node.path}`))) return;
+      await api("/api/roots?path=" + encodeURIComponent(node.path), { method: "DELETE" });
+      if (state.filter.dir === node.path) state.filter.dir = "";
+      await loadImages(); loadFolders();
+    }, "danger");
+  }
+  menu.hidden = false;
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  menu.style.left = Math.min(ev.clientX, innerWidth - mw - 8) + "px";
+  menu.style.top = Math.min(ev.clientY, innerHeight - mh - 8) + "px";
+}
+
+function samePath(a, b) {
+  const norm = (s) => String(s || "").replace(/[\\/]+/g, "\\").replace(/\\+$/, "").toLowerCase();
+  return norm(a) === norm(b);
+}
+
 async function loadSidebar() {
   await Promise.all([loadFolders(), loadTags()]);
 }
@@ -726,11 +1149,18 @@ const BOARD_NODE_KIND = {
 
 function boardNodeTitle(node) {
   if (node.type === "group") return node.label || "分组";
-  if (node.type === "link") return node.url || "链接卡片";
+  if (node.type === "link") return window.boardLinkInfo?.(node)?.name || "链接卡片";
   if (node.type === "comfy") return node.title || node.cls || "ComfyUI 节点";
   const first = String(node.text || "").split("\n").find((s) => s.trim()) || "";
   return first.replace(/^#{1,6}\s*/, "").slice(0, 60) ||
     (node.type === "md" ? "未命名 Markdown" : "文本节点");
+}
+
+/* 链接卡片存的就是一行 Markdown：[名称](地址)，侧栏也按这个格式编辑 */
+function boardLinkText(node) {
+  const text = String(node.text || "").trim();
+  if (text) return text;
+  return node.url ? `[${node.url}](${node.url})` : "";
 }
 
 /* 信息栏标题：既是显示，也是改名入口。
@@ -746,8 +1176,25 @@ function setInspName(text, opts = {}) {
 
 function hideBoardNodeEditor() {
   boardNodeEdit = null;
-  const panel = $("#insp-board-node");
-  if (panel) panel.hidden = true;
+  for (const sel of ["#insp-board-node", "#insp-multi"]) {
+    const panel = $(sel);
+    if (panel) panel.hidden = true;
+  }
+}
+
+/* 画布多选：信息栏只报数量，不冒充其中某一个节点 */
+function showBoardMultiInspector(n) {
+  hideBoardNodeEditor();
+  state.selected = null;
+  currentMeta = null;
+  $("#insp-empty").hidden = true;
+  $("#insp-body").hidden = true;
+  $("#insp-thumb").removeAttribute("src");
+  $("#insp-thumb").parentElement.classList.remove("has-img");
+  setInspName(`${n} 项`, { title: "画布多选" });
+  $("#insp-multi-count").textContent = `${n} 项`;
+  panelShow("#insp-multi");
+  setInspector(true);
 }
 
 /* 画布节点 → 右侧介绍栏。文字 / Markdown / 组直接在介绍栏编辑，
@@ -769,21 +1216,18 @@ function showBoardNodeInspector(node, opts = {}) {
     `${Math.round(node.w)} × ${Math.round(node.h)}`;
   const label = $("#insp-node-label");
   const text = $("#insp-node-text");
-  const hint = $("#insp-node-hint");
   const isComfy = node.type === "comfy";
   label.textContent = node.type === "group" ? "组名称"
-    : node.type === "link" ? "链接地址"
+    : node.type === "link" ? "链接（Markdown 格式）"
     : node.type === "md" ? "Markdown 内容"
     : isComfy ? "节点参数（只读）" : "文本内容";
   text.readOnly = isComfy;
+  text.placeholder = node.type === "link" ? "[名称](链接地址)" : "在这里输入内容…";
   text.value = node.type === "group" ? (node.label || "")
-    : node.type === "link" ? (node.url || "")
+    : node.type === "link" ? boardLinkText(node)
     : isComfy
       ? [node.title || node.cls, ...(node.widgets || []).map((w) => `${w.k}: ${w.v}`)].join("\n")
       : (node.text || "");
-  hint.textContent = isComfy
-    ? "ComfyUI 节点由节点图导入，参数只读；可在画布上移动或删除。"
-    : "修改会实时同步到画布，并自动保存。";
   panelShow("#insp-board-node");
   setInspector(true);
   if (opts.focus) setTimeout(() => text.focus(), 30);
@@ -800,22 +1244,37 @@ function onBoardNodeInput(value) {
 
 window.showBoardNodeInspector = showBoardNodeInspector;
 window.hideBoardNodeInspector = hideBoardNodeEditor;
+window.showBoardMultiInspector = showBoardMultiInspector;
+/* 多选数量变化时只更新数字（面板没开着就不动，免得拖框选中途把面板挤开） */
+window.updateBoardMultiCount = (n) => {
+  const panel = $("#insp-multi");
+  if (!panel || panel.hidden) return;
+  $("#insp-multi-count").textContent = `${n} 项`;
+  setInspName(`${n} 项`, { title: "画布多选" });
+};
+window.hideBoardMultiInspector = () => {
+  const panel = $("#insp-multi");
+  if (!panel || panel.hidden) return;
+  panel.hidden = true;
+  $("#insp-empty").hidden = false;
+  setInspName("未选择图片");
+};
 window.setInspectorName = setInspName;
 
 const inspPinned = () => localStorage.getItem("texture.inspPin") !== "0";
 
-/* 图钉不再是单独的按钮：固定状态直接挂在「信息栏」开关上（默认展开即固定）。
-   Alt / Shift 点击开关 = 只切固定，不动开合。 */
+/* 图钉不再是单独的按钮：固定状态挂在「信息栏」开关上（默认展开即固定）。
+   Alt / Shift 点击开关 = 只切固定，不动开合。
+   注意：开关外观现在只有「黑底黄字 / 黄底黑字」两种，不再画小方块，
+   所以固定与否只体现在 title 与 aria-pressed 上。 */
 function refreshInspPin() {
   const btn = $("#insp-toggle");
   if (!btn) return;
   const open = $("#main").classList.contains("insp-open");
   const on = open && inspPinned();
-  btn.classList.toggle("pinned", on);
   btn.setAttribute("aria-pressed", String(on));
   btn.title = !open ? "展开信息栏 (I)"
-    : on ? "信息栏已固定：放大看图时不收起（Alt+点击可取消固定）"
-    : "信息栏未固定：放大看图会自动收起（Alt+点击改回固定）";
+    : on ? "信息栏 · 已固定" : "信息栏 · 未固定";
 }
 
 function setInspector(open, save = true, autoPin = true) {
@@ -838,6 +1297,7 @@ const inspSavedOpen = () => localStorage.getItem("texture.insp") !== "0";
 function restoreGalleryInspector() {
   const node = $("#insp-board-node");
   if (node) node.hidden = true;
+  if (state.selected && isPrivateFid(state.selected)) { showPrivateInspector(); return; }
   if (state.selected) {
     const cached = metaCache.get(state.selected);
     if (cached) { currentMeta = cached; fillInspector(cached); return; }
@@ -845,10 +1305,11 @@ function restoreGalleryInspector() {
       .then((meta) => {
         if (state.selected) { metaCache.set(state.selected, meta); currentMeta = meta; fillInspector(meta); }
       })
-      .catch(() => {});
+      .catch(() => { if (state.selected) showPrivateInspector(); });
     return;
   }
   currentMeta = null;
+  hidePrivateInspector();
   setInspName("未选择图片");
   $("#insp-thumb").removeAttribute("src");
   $("#insp-thumb").parentElement.classList.remove("has-img");
@@ -859,6 +1320,7 @@ function restoreGalleryInspector() {
 async function selectImage(id) {
   hideBoardNodeEditor();
   if (tagSaveTimer) await flushTagDoc();   // 切图前先把没落盘的胶囊存了
+  if (isPrivateFid(id)) { showPrivateInspector(); return; }
   state.selected = id;
   const idx = state.items.findIndex((x) => x.id === id);
   if (idx >= 0) state.idx = idx;
@@ -870,7 +1332,14 @@ async function selectImage(id) {
   }
   const cached = metaCache.get(id);
   if (cached) { currentMeta = cached; fillInspector(cached); return; }
-  const meta = await api("/api/meta/" + id);
+  let meta;
+  try {
+    meta = await api("/api/meta/" + id);
+  } catch {
+    // 隐私文件夹里的图片后端直接 404：当作不可见处理，不显示破图
+    if (state.selected === id) showPrivateInspector();
+    return;
+  }
   if (state.selected !== id) return;
   metaCache.set(id, meta);
   currentMeta = meta;
@@ -880,6 +1349,7 @@ async function selectImage(id) {
 function fillInspector(meta) {
   const params = meta.params || {};
   const fid = state.selected || meta.id || "";
+  hidePrivateInspector();
   $("#insp-empty").hidden = true;
   const body = $("#insp-body");
   body.hidden = false;
@@ -1357,8 +1827,8 @@ function showTab(name) {
       const empty = $("#graph-empty");
       if (!empty.textContent.trim()) {
         empty.textContent = state.selected
-          ? "这张图没有可用的节点图 —— 节点图只对 ComfyUI 生成的图片有效。"
-          : "选中一张图片后，这里显示它的 ComfyUI 节点图。";
+          ? "此图无节点图"
+          : "未选择图片";
       }
       empty.hidden = false;
     }
@@ -1582,17 +2052,17 @@ function setNav(open, save = true, autoPin = true) {
 
 const navPinned = () => localStorage.getItem("texture.navPin") !== "0";
 
-/* 图钉并进「侧栏」开关本身：图标亮黄 = 已固定（默认） */
+/* 图钉并进「侧栏」开关本身：Alt/Shift 点击只切固定。
+   开关外观只有两态（展开＝整块黄，收起＝黑底黄字），不画小方块。 */
 function refreshNavPin() {
   const btn = $("#nav-toggle");
   if (!btn) return;
   const open = !document.body.classList.contains("nav-closed");
   const on = open && navPinned();
-  btn.classList.toggle("pinned", on);
+  btn.classList.toggle("on", open);      // 展开＝整块黄，收起＝黑底黄字
   btn.setAttribute("aria-pressed", String(on));
   btn.title = !open ? "打开侧栏 (N)"
-    : on ? "侧栏已固定：选文件夹不会自动收起（点一下收起，Alt+点击可取消固定）"
-    : "侧栏未固定：选文件夹后会自动收起（Alt+点击改回固定）";
+    : on ? "侧栏 · 已固定" : "侧栏 · 未固定";
 }
 
 function bindNav() {
@@ -1605,7 +2075,7 @@ function bindNav() {
     if (ev.altKey || ev.shiftKey) {          // Alt/Shift 点击 = 只切固定
       localStorage.setItem("texture.navPin", navPinned() ? "0" : "1");
       refreshNavPin();
-      toast(navPinned() ? "侧栏已固定" : "侧栏取消固定：选文件夹后自动收起");
+      toast(navPinned() ? "侧栏已固定" : "侧栏未固定");
       return;
     }
     setNav(document.body.classList.contains("nav-closed"));
@@ -1619,7 +2089,10 @@ async function addSelectionToBoard() {
     toast("白板尚未就绪");
     return 0;
   }
-  return window.addImagesToBoard([...state.selection]);
+  const n = await window.addImagesToBoard([...state.selection]);
+  // 选中权移交给画板（那边整批已经选中），图库这条浮条就该收起
+  if (n) clearGallerySelection();
+  return n;
 }
 
 /* ---------------- 左右面板拖拽调宽 ---------------- */
@@ -1729,14 +2202,8 @@ function bindEvents() {
     loadImages(); loadSidebar();
   });
 
-  $("#btn-add-root").addEventListener("click", async () => {
-    const path = await pickFolder();
-    if (!path) return;
-    try {
-      await api("/api/roots", { method: "POST", body: { path } });
-    } catch (e) { appAlert("添加失败：" + e.message); return; }
-    await loadImages(); loadSidebar();
-  });
+  /* 添加文件夹：先选方式，再填一个或多个路径 */
+  $("#btn-add-root").addEventListener("click", () => openAddRoot());
 
   const rescan = async () => {
     const stat = $("#stat");
@@ -1753,10 +2220,11 @@ function bindEvents() {
   $("#bsel-fav").addEventListener("click", batchFav);
   $("#bsel-tag").addEventListener("click", batchTag);
   $("#bsel-del").addEventListener("click", () => batchDelete([...state.selection]));
-  $("#bsel-clear").addEventListener("click", () => {
-    state.selection.clear();
-    document.querySelectorAll(".cell.picked").forEach((c) => c.classList.remove("picked"));
-    syncSelectionBar();
+  $("#bsel-clear").addEventListener("click", clearGallerySelection);
+  /* 画板上只留这一个动作：把图库里已选的那批整批放进画板 */
+  $("#bsel-to-board").addEventListener("click", async () => {
+    const n = await addSelectionToBoard();
+    if (n) toast(`已放入画板（${n} 张）`);
   });
 
   $("#lb-close").addEventListener("click", closeLightbox);
@@ -1768,7 +2236,7 @@ function bindEvents() {
     if (ev.altKey || ev.shiftKey) {
       localStorage.setItem("texture.inspPin", inspPinned() ? "0" : "1");
       refreshInspPin();
-      toast(inspPinned() ? "信息栏已固定" : "信息栏取消固定：放大看图会自动收起");
+      toast(inspPinned() ? "信息栏已固定" : "信息栏未固定");
       return;
     }
     setInspector(!$("#main").classList.contains("insp-open"));
@@ -1954,19 +2422,144 @@ function bindEvents() {
   });
   $("#grid").classList.toggle("uniform", state.layout === "uniform");
 
-  /* 主题 */
+  /* 主题（记忆在 localStorage，桌面模式靠 webview 持久化配置目录） */
   applyTheme(localStorage.getItem("texture.theme") || "light");
   $("#set-theme").addEventListener("click", () => {
     const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
     applyTheme(next);
     toast(next === "light" ? "已切换到浅色主题" : "已切换到深色主题");
   });
+
+  /* 偏好设置面板 */
+  $("#set-prefs").addEventListener("click", openPrefs);
+  $("#pf-close").addEventListener("click", closePrefs);
+  $("#prefs .pf-mask").addEventListener("click", closePrefs);
+
+  document.querySelectorAll("#pf-theme button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      applyTheme(btn.dataset.theme);
+      fillPrefs();
+    });
+  });
+
+  /* 字号：改一项就立刻生效，不需要点确定 */
+  document.querySelectorAll("#pf-board-font button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      boardText.font = btn.dataset.boardFont;
+      applyBoardText();
+    });
+  });
+  const uiSize = $("#pf-ui-size");
+  if (uiSize) {
+    uiSize.value = boardText.size;
+    const commitUiSize = () => {
+      const n = Math.min(UI_MAX, Math.max(UI_MIN, Math.round(Number(uiSize.value) || UI_DEFAULT)));
+      uiSize.value = n;
+      boardText.size = n;
+      applyBoardText();
+    };
+    uiSize.addEventListener("change", commitUiSize);
+    uiSize.addEventListener("blur", commitUiSize);
+  }
+  applyBoardText();
+
+  const undoInput = $("#pf-undo");
+  const commitUndo = async () => {
+    const n = Math.max(5, Math.min(500, Math.round(Number(undoInput.value) || 50)));
+    undoInput.value = n;
+    if (n === Number(prefs.undo_limit)) return;
+    await savePrefs({ undo_limit: n });
+    toast(`撤销保留步数：${n}`);
+  };
+  undoInput.addEventListener("change", commitUndo);
+  undoInput.addEventListener("blur", commitUndo);
+
+  const imgInput = $("#pf-image-dir");
+  const commitImageDir = async () => {
+    const v = imgInput.value.trim();
+    if (v === (prefs.image_dir || "")) return;
+    if (await savePrefs({ image_dir: v })) {
+      imgInput.value = prefs.image_dir || "";
+      toast(v ? "内置图片位置已更新" : "已恢复默认位置");
+    }
+  };
+  imgInput.addEventListener("change", commitImageDir);
+  imgInput.addEventListener("keydown", (ev) => { if (ev.key === "Enter") commitImageDir(); });
+  $("#pf-pick-image").addEventListener("click", async () => {
+    const p = await pickFolder();
+    if (!p) return;
+    imgInput.value = p;
+    commitImageDir();
+  });
+
+  $("#pf-apply-data").addEventListener("click", async () => {
+    const target = ($("#pf-data-dir").value || "").trim();
+    if (!target) { toast("先填写数据目录的绝对路径"); return; }
+    if (!(await appConfirm(
+      `把数据库与缩略图迁移到：\n${target}\n\n` +
+      "会复制过去（旧目录保留作备份），重启 Texture 后生效。继续吗？"))) return;
+    try {
+      const res = await api("/api/settings/storage", { method: "POST", body: { data_dir: target } });
+      toast(`已复制 ${res.copied.join("、") || "（无文件）"}，重启后生效`);
+    } catch (e) {
+      appAlert("迁移失败：" + e.message);
+    }
+  });
+
+  $("#pf-privacy").addEventListener("change", (ev) => togglePrivacy(ev.target.checked));
+
+  /* 添加文件夹面板 */
+  $("#ar-close").addEventListener("click", closeAddRoot);
+  $("#ar-cancel").addEventListener("click", closeAddRoot);
+  $("#add-root .ar-mask").addEventListener("click", closeAddRoot);
+  $("#ar-ok").addEventListener("click", submitAddRoot);
+  $("#ar-paths").addEventListener("input", syncAddRoot);
+  $("#ar-paths").addEventListener("keydown", (ev) => {
+    // 单行输入时回车直接提交；多行粘贴不受影响
+    if (ev.key === "Enter" && !ev.shiftKey && !ev.target.value.includes("\n")) {
+      ev.preventDefault();
+      submitAddRoot();
+    }
+    ev.stopPropagation();
+  });
+  document.querySelectorAll("#add-root .ar-mode").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      addRootMode = btn.dataset.mode;
+      document.querySelectorAll("#add-root .ar-mode").forEach((b) => {
+        const on = b.dataset.mode === addRootMode;
+        b.classList.toggle("active", on);
+        b.setAttribute("aria-checked", String(on));
+      });
+      syncAddRoot();
+    });
+  });
+  $("#ar-browse").addEventListener("click", async () => {
+    const p = await pickFolder();
+    if (!p) return;
+    const box = $("#ar-paths");
+    const cur = box.value.trim();
+    box.value = cur ? `${cur}\n"${p}"` : `"${p}"`;
+    syncAddRoot();
+  });
+
   $("#hk-reset-all")?.addEventListener("click", () => Hotkeys.resetAll());
-  $("#set-shortcuts").addEventListener("click", () => { Hotkeys.renderPanel(); $("#shortcuts").hidden = false; });
+
+  /* 启动时拉一次服务端偏好，再对齐隐私状态与快捷键面板 */
+  loadPrefs().then(() => {
+    fillPrefs();
+    refreshPrivacy();
+  });
 
   document.addEventListener("keydown", (ev) => {
     const inField = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName)
       || document.activeElement?.isContentEditable;
+    if (!$("#add-root").hidden) {
+      if (ev.key === "Escape") { closeAddRoot(); return; }
+      if (inField) return;               // 面板里打字时不吃全局键
+    }
+    if (!$("#prefs").hidden && ev.key === "Escape") { closePrefs(); return; }
+    if (!inField && Hotkeys.match(ev, "app.prefs")) { ev.preventDefault(); openPrefs(); return; }
+    if (!$("#prefs").hidden) return;   // 面板开着时不吃其它快捷键
     if (!$("#lightbox").hidden) {
       if (ev.key === "Escape") closeLightbox();
       if (ev.key === "ArrowLeft") stepLightbox(-1);
@@ -1978,7 +2571,11 @@ function bindEvents() {
     }
     // 画板视图的快捷键由 board.js 负责，这里只处理图库
     if ($("#view-board").hidden === false) {
-      if (ev.key === "Escape" && !$("#shortcuts").hidden) $("#shortcuts").hidden = true;
+      return;
+    }
+    if (!inField && Hotkeys.match(ev, "app.search")) {
+      ev.preventDefault();
+      focusSearch();
       return;
     }
     if (ev.key === "ArrowLeft" && !inField) stepLightbox(-1);
@@ -1990,12 +2587,10 @@ function bindEvents() {
       document.querySelectorAll(".cell").forEach((c) => c.classList.add("picked"));
       syncSelectionBar();
     }
-    if (!inField && Hotkeys.match(ev, "gallery.panel")) { Hotkeys.renderPanel(); $("#shortcuts").hidden = !$("#shortcuts").hidden; }
     if (!inField && Hotkeys.match(ev, "gallery.info")) {
       setInspector(!$("#main").classList.contains("insp-open"));
     }
     if (ev.key === "Escape") {
-      if (!$("#shortcuts").hidden) { $("#shortcuts").hidden = true; return; }
       if (state.selection.size) {
         state.selection.clear();
         document.querySelectorAll(".cell.picked").forEach((c) => c.classList.remove("picked"));
@@ -2043,6 +2638,9 @@ function bindEvents() {
 let onSwitchToBoard = null;
 function switchView(view) {
   if (view !== "board" && typeof window.onLeaveBoard === "function") window.onLeaveBoard();
+  /* 图库的多选跨视图保留：切到画板不再清空，回到图库原样还在；
+     浮条在画板上换成「放入画板」一个动作（样式按 body.board-view 切） */
+  document.body.classList.toggle("board-view", view === "board");
   /* 离开画板时把信息栏还给图库：否则会残留画布节点编辑面板 */
   if (view !== "board") {
     window.hideBoardNodeInspector?.();

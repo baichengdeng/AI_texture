@@ -4,6 +4,9 @@
 """
 import json
 import os
+import re
+import shutil
+import time
 import unicodedata
 import urllib.parse
 import uuid
@@ -17,9 +20,10 @@ from pydantic import BaseModel
 from .comfy_graph import graph_to_board, read_graph_for_file
 from .export import board_to_canvas, board_to_html, to_a1111_text
 from .metadata import router as meta_router
-from .scanner import Scanner, fid_for
-from .store import DATA_DIR, Store, clean_segs
-from .thumbnails import get_thumbnail
+from .scanner import SUPPORTED_EXTS, Scanner, fid_for
+from .settings import DATA_DIR, migrate_data
+from .store import UNDO_MAX, UNDO_MIN, Store, clean_segs
+from .thumbnails import THUMB_DIR, get_thumbnail
 from .winrecycle import delete_to_recyclebin
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -32,6 +36,140 @@ scanner = Scanner(store)
 _items_by_id: dict = {}
 _items_list: list = []
 
+# ---------------- 隐私模式 ----------------
+# 开关只在本次运行有效：重启后恒为关闭，避免「上次开着，这次悄悄全露出来」。
+_privacy_on = False
+_private_fids: set = set()
+_private_dirs: list = []
+
+
+def _norm_path(p) -> str:
+    try:
+        return os.path.normcase(os.path.normpath(str(p)))
+    except (TypeError, ValueError):
+        return str(p)
+
+
+def _reload_privacy() -> None:
+    global _private_fids, _private_dirs
+    _private_fids = store.private_fids()
+    _private_dirs = [_norm_path(p) for p in store.private_dirs()]
+
+
+def set_privacy(on: bool) -> None:
+    global _privacy_on
+    _privacy_on = bool(on)
+
+
+def privacy_on() -> bool:
+    return _privacy_on
+
+
+def _hidden(it: dict) -> bool:
+    """这条记录在当前模式下该不该藏起来。隐私模式开着就一律不藏。"""
+    if _privacy_on:
+        return False
+    if it.get("id") in _private_fids:
+        return True
+    d = _norm_path(it.get("dir") or "")
+    for pd in _private_dirs:
+        if d == pd or d.startswith(pd + os.sep):
+            return True
+    return False
+
+
+def _visible(items: list) -> list:
+    return [it for it in items if not _hidden(it)]
+
+
+# ---------------- 搜索语法 ----------------
+# 空格（或逗号）分隔＝同时包含；/正则/flags 走正则。写成纯函数，便于单测。
+#
+# 拆词不能直接 re.split：正则里常有空格（/Save Image/），先按斜杠划出整段更省事。
+
+_REGEX_TOKEN = re.compile(r"^/(.+)/([imsx]*)$", re.S)
+_REGEX_FLAGS = {"i": re.I, "m": re.M, "s": re.S, "x": re.X}
+_SEPARATORS = " \t\r\n,，、\u3000"
+
+
+def split_query(text: str) -> list:
+    """把查询串拆成词，但 /…/ 里的内容整体算一个词。
+
+    词首的斜杠进入正则模式，跳到配对的斜杠（`\\/` 视为转义）为止；
+    找不到收尾斜杠就当作普通文字，交给后面降级。
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "/" and not buf:
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == "/":
+                    break
+                j += 1
+            if j < n:                       # 有收尾斜杠
+                buf.append(text[i:j + 1])
+                i = j + 1
+                continue
+        if ch in _SEPARATORS:
+            if buf:
+                out.append("".join(buf))
+                buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def parse_search(q: str) -> tuple:
+    """查询串 → (matchers, error)。
+
+    matchers 是 [("sub", 小写词)] 或 [("re", 编译好的正则)]，全部按 AND 叠加。
+    正则写错时不报错、降级成字面量，同时把错误原文回传给前端提示。
+    """
+    text = unicodedata.normalize("NFKC", q or "").strip()
+    if not text:
+        return [], ""
+    out, error = [], ""
+    for token in split_query(text):
+        if not token:
+            continue
+        m = _REGEX_TOKEN.match(token)
+        if not m:
+            out.append(("sub", token.lower()))
+            continue
+        body, flags = m.group(1), m.group(2).lower()
+        extra = 0
+        for ch in flags:
+            extra |= _REGEX_FLAGS.get(ch, 0)
+        try:
+            out.append(("re", re.compile(body, re.I | extra)))
+        except re.error as e:
+            error = f"{body} —— {e}"
+            out.append(("sub", token.lower()))
+    return out, error
+
+
+def search_hit(matchers: list, hay: str, hay_low: str) -> bool:
+    for kind, pat in matchers:
+        if kind == "sub":
+            if pat not in hay_low:
+                return False
+        elif not pat.search(hay):
+            return False
+    return True
+
+
+_reload_privacy()
+
 
 def _refresh(stealth: bool = False):
     global _items_by_id, _items_list
@@ -43,9 +181,41 @@ def _item(fid: str) -> dict:
     if fid not in _items_by_id:
         _refresh()
     it = _items_by_id.get(fid)
-    if not it:
-        raise HTTPException(404, "图片不在图库中（可能已删除，试试刷新）")
+    if not it or _hidden(it):
+        raise HTTPException(404, "图片不在图库中（可能已删除，或处于隐私文件夹里）")
     return it
+
+
+def _hidden_fid(fid: str) -> bool:
+    """按图片指纹判断是否被隐私藏起来（画板节点、导出这类只知道 fid 的场合用）。"""
+    if _privacy_on or not fid:
+        return False
+    it = _items_by_id.get(fid)
+    if it is None and fid not in _items_by_id:
+        if not _items_list:
+            _refresh()
+        it = _items_by_id.get(fid)
+    return _hidden({"id": fid, "dir": (it or {}).get("dir") or ""})
+
+
+def _mask_hidden_nodes(board: dict) -> dict:
+    """隐私模式关闭时，把指向隐私图片的画板节点标成 hidden 并抹掉路径。
+
+    只标不影响保存：前端按 hidden 画占位，把节点原样留在画板上，
+    下次打开隐私模式内容自己回来。路径一并去掉，避免占位里露出文件名。
+    """
+    if _privacy_on:
+        return board
+    for it in board.get("items", []):
+        if it.get("type") not in ("image", "file"):
+            continue
+        fid = str(it.get("fileId") or it.get("id") or "")
+        if not _hidden_fid(fid):
+            continue
+        it["hidden"] = True
+        it.pop("path", None)
+        it.pop("src", None)
+    return board
 
 
 def _full_meta(it: dict) -> dict:
@@ -106,7 +276,15 @@ class RootIn(BaseModel):
 
 @app.get("/api/roots")
 def api_roots():
-    return {"roots": store.roots()}
+    keep = []
+    for r in store.roots():
+        nr = _norm_path(r)
+        if not _privacy_on and any(
+                nr == pd or nr.startswith(pd + os.sep) or pd.startswith(nr + os.sep)
+                for pd in _private_dirs):
+            continue
+        keep.append(r)
+    return {"roots": keep}
 
 
 @app.post("/api/roots")
@@ -159,20 +337,15 @@ def api_images(
         _refresh()
     import unicodedata
 
+    visible = _visible(_items_list)
     favs = store.favs()
     tag_map = store.all_tags()
     items = []
-    # 多关键词 AND：逗号（中/英文）分隔，每个词都须命中
-    terms = []
-    if q:
-        terms = [
-            unicodedata.normalize("NFKC", t).lower()
-            for t in (part.strip() for part in q.replace("，", ",").split(","))
-            if t
-        ]
+    # 多关键词 AND：空格（或逗号）分隔，每个词都须命中；/正则/flags 走正则
+    matchers, regex_error = parse_search(q)
     # 搜索范围：文件名 + 正负提示词 + 标签 + TAG 分格内容
     rev_tags: dict = {}
-    if terms:
+    if matchers:
         for name, ids in tag_map.items():
             for fid in ids:
                 rev_tags.setdefault(fid, []).append(name)
@@ -183,8 +356,8 @@ def api_images(
     want_tags = [t.strip() for t in tags.replace("，", ",").split(",") if t.strip()]
     if tag and tag not in want_tags:
         want_tags.append(tag)
-    for it in _items_list:
-        if terms:
+    for it in visible:
+        if matchers:
             hay = unicodedata.normalize(
                 "NFKC",
                 " ".join((
@@ -194,8 +367,8 @@ def api_images(
                     " ".join(rev_tags.get(it["id"], ())),
                     tag_docs.get(it["id"], ""),
                 )),
-            ).lower()
-            if not all(t in hay for t in terms):
+            )
+            if not search_hit(matchers, hay, hay.lower()):
                 continue
         item_source = it["meta"].get("source", "none")
         if source and item_source != source:
@@ -222,8 +395,8 @@ def api_images(
             continue
         items.append(_summary(it, favs, tag_map))
     # 过滤选项
-    models = sorted({m for it in _items_list if (m := it["meta"].get("params", {}).get("model"))})
-    samplers = sorted({s for it in _items_list if (s := it["meta"].get("params", {}).get("sampler"))})
+    models = sorted({m for it in visible if (m := it["meta"].get("params", {}).get("model"))})
+    samplers = sorted({s for it in visible if (s := it["meta"].get("params", {}).get("sampler"))})
     # 排序：time/name/size/type + asc/desc
     sort_key, _, sort_dir = sort.partition("-")
     keymap = {
@@ -234,7 +407,8 @@ def api_images(
     }
     if sort_key in keymap:
         items.sort(key=keymap[sort_key], reverse=sort_dir != "asc")
-    return {"total": len(items), "items": items, "models": models, "samplers": samplers}
+    return {"total": len(items), "items": items, "models": models,
+            "samplers": samplers, "regexError": regex_error}
 
 
 @app.get("/api/facets")
@@ -244,7 +418,7 @@ def api_facets(dir: str = "", subfolders: bool = True):
         _refresh()
     favs = store.favs()
     counts = {"total": 0, "fav": 0, "comfyui": 0, "webui": 0, "none": 0}
-    for it in _items_list:
+    for it in _visible(_items_list):
         if not _under_dir(it, dir, subfolders):
             continue
         counts["total"] += 1
@@ -314,13 +488,241 @@ def api_folders():
     """侧栏文件夹树（一次返回，容量几千张时足够轻）。"""
     if not _items_list:
         _refresh()
-    return {"roots": _folder_tree(_items_list), "total": len(_items_list)}
+    visible = _visible(_items_list)
+    return {"roots": _folder_tree(visible), "total": len(visible)}
 
 
 @app.post("/api/rescan")
 def api_rescan():
     _refresh()
     return {"total": len(_items_list)}
+
+
+# ---------------- 偏好设置 / 存储位置 ----------------
+
+def _privacy_payload() -> dict:
+    if _private_fids and not _items_list:
+        _refresh()
+    items = []
+    for fid in sorted(_private_fids):
+        it = _items_by_id.get(fid)
+        items.append({
+            "id": fid,
+            "name": it["name"] if it else fid,
+            "dir": it["dir"] if it else "",
+        })
+    return {
+        "on": _privacy_on,
+        "items": items,
+        "dirs": store.private_dirs(),
+        "count": len(_private_fids) + len(_private_dirs),
+    }
+
+
+def _settings_payload() -> dict:
+    s = store.settings()
+    return {
+        "undo_limit": s["undo_limit"],
+        "image_dir": str(store.image_dir()),
+        "data_dir": str(DATA_DIR),
+        "default_image_dir": str(DATA_DIR / "library"),
+        "undo_min": UNDO_MIN,
+        "undo_max": UNDO_MAX,
+        "privacy": _privacy_payload(),
+    }
+
+
+class SettingsIn(BaseModel):
+    undo_limit: int = None
+    image_dir: str = None
+
+
+@app.get("/api/settings")
+def api_settings():
+    return _settings_payload()
+
+
+@app.post("/api/settings")
+def api_save_settings(body: SettingsIn):
+    updates = {}
+    if body.undo_limit is not None:
+        updates["undo_limit"] = body.undo_limit
+    if body.image_dir is not None:
+        raw = str(body.image_dir).strip()
+        if not raw:
+            updates["image_dir"] = ""
+        else:
+            p = Path(raw).expanduser()
+            if not p.is_absolute():
+                raise HTTPException(400, "请填写绝对路径，例如 D:\\TextureImages")
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+                probe = p / ".texture-write-test"
+                probe.write_text("ok", encoding="utf-8")
+                probe.unlink(missing_ok=True)
+            except OSError as e:
+                raise HTTPException(400, f"这个目录不可写：{e}")
+            updates["image_dir"] = str(p.resolve())
+    try:
+        store.set_settings(updates)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _settings_payload()
+
+
+class StorageIn(BaseModel):
+    data_dir: str
+
+
+@app.post("/api/settings/storage")
+def api_storage(body: StorageIn):
+    """把数据库与缩略图迁到新位置；写入指针后需要重启才生效。"""
+    raw = str(body.data_dir or "").strip()
+    if not raw:
+        raise HTTPException(400, "请填写数据目录")
+    target = Path(raw).expanduser()
+    if not target.is_absolute():
+        raise HTTPException(400, "请填写绝对路径，例如 D:\\TextureData")
+    try:
+        info = migrate_data(target)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "restart": True, "data_dir": str(target.resolve()), **info}
+
+
+# ---------------- 隐私模式 ----------------
+
+class PrivacyModeIn(BaseModel):
+    on: bool = False
+
+
+class PrivacyMarkIn(BaseModel):
+    fid: str = ""
+    path: str = ""
+    private: bool = True
+
+
+@app.get("/api/privacy")
+def api_privacy():
+    return _privacy_payload()
+
+
+@app.post("/api/privacy/mode")
+def api_privacy_mode(body: PrivacyModeIn):
+    set_privacy(body.on)
+    return _privacy_payload()
+
+
+@app.post("/api/privacy/mark")
+def api_privacy_mark(body: PrivacyMarkIn):
+    if body.fid:
+        store.set_private_fid(body.fid, body.private)
+    elif body.path:
+        p = Path(body.path).expanduser()
+        try:
+            p = p.resolve()
+        except OSError:
+            raise HTTPException(400, "路径不合法")
+        if not p.is_dir():
+            raise HTTPException(400, "不是有效文件夹")
+        store.set_private_dir(str(p), body.private)
+    else:
+        raise HTTPException(400, "缺少 fid 或 path")
+    _reload_privacy()
+    return _privacy_payload()
+
+
+# ---------------- 添加文件夹（导入 / 只读） ----------------
+
+class ImportRootIn(BaseModel):
+    path: str
+
+
+def _import_root(src: Path) -> dict:
+    """把一个文件夹里的图片复制到内置位置，校验后再把原件移入回收站。"""
+    if not src.is_dir():
+        raise ValueError(f"不是有效文件夹：{src}")
+    dest = store.image_dir() / f"{src.name or 'import'}_{time.strftime('%Y%m%d_%H%M%S')}"
+    copied, failed = [], []
+    for p in src.rglob("*"):
+        if p.suffix.lower() not in SUPPORTED_EXTS or not p.is_file():
+            continue
+        out = dest / p.relative_to(src)
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, out)
+            copied.append((p, out))
+        except OSError:
+            failed.append(str(p))
+    removed = 0
+    for orig, new in copied:
+        try:
+            if new.stat().st_size != orig.stat().st_size:
+                continue
+        except OSError:
+            continue
+        ok, _bad = delete_to_recyclebin([str(orig)])
+        removed += ok
+    added = ""
+    if copied:
+        try:
+            added = store.add_root(str(dest))
+        except ValueError:
+            added = str(dest)   # 与已有根目录重叠时也能用，只是不重复登记
+    return {
+        "source": str(src),
+        "dest": str(dest),
+        "root": added,
+        "copied": len(copied),
+        "removed": removed,
+        "failed": len(failed),
+    }
+
+
+@app.post("/api/roots/import")
+def api_import_root(body: ImportRootIn):
+    """把源文件夹里的图片复制到内置位置，校验后再把原件移入回收站。"""
+    try:
+        info = _import_root(Path(str(body.path or "").strip()).expanduser())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _refresh()
+    return {"ok": True, **info}
+
+
+class BatchRootIn(BaseModel):
+    paths: list = None
+    mode: str = "read"      # read＝只读取；import＝复制到内置位置后清空原文
+
+
+@app.post("/api/roots/batch")
+def api_batch_roots(body: BatchRootIn):
+    """批量登记文件夹。逐个处理，单个失败不影响其余，最后汇总。"""
+    raw = [str(p or "").strip() for p in (body.paths or [])]
+    paths = list(dict.fromkeys(p for p in raw if p))     # 去空、去重、保序
+    if not paths:
+        raise HTTPException(400, "没有可添加的文件夹")
+    mode = body.mode if body.mode in ("read", "import") else "read"
+    done, skipped = [], []
+    for p in paths:
+        try:
+            src = Path(p).expanduser()
+            if not src.is_dir():
+                skipped.append({"path": p, "reason": "不是有效文件夹"})
+                continue
+            if mode == "import":
+                info = _import_root(src)
+                done.append({"path": info["dest"], "source": info["source"],
+                             "mode": "import", "copied": info["copied"],
+                             "removed": info["removed"], "failed": info["failed"]})
+            else:
+                done.append({"path": store.add_root(str(src)), "mode": "read"})
+        except (ValueError, OSError) as e:
+            skipped.append({"path": p, "reason": str(e)[:120]})
+    _refresh()
+    return {"ok": True, "added": done, "skipped": skipped,
+            "mode": mode, "roots": store.roots()}
+
 
 
 @app.get("/api/file/{fid}")
@@ -787,14 +1189,30 @@ def api_get_board(bid: int):
     b = store.board(bid)
     if not b:
         raise HTTPException(404, "画板不存在")
-    return b
+    return _mask_hidden_nodes(b)
 
 
 @app.put("/api/boards/{bid}")
 def api_save_board(bid: int, body: BoardIn):
     if not store.board(bid):
         raise HTTPException(404, "画板不存在")
-    store.save_board(bid, body.name, body.items, body.edges)
+    items = body.items
+    if isinstance(items, list):
+        prev = {str(it.get("id")): it for it in ((store.board(bid) or {}).get("items") or [])}
+        clean = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            # hidden 只是读取时的遮罩状态，不能存进库，否则隐私模式再开也回不来
+            it = {k: v for k, v in it.items() if k != "hidden"}
+            # 遮罩过的节点缺 path/src：从库里补回来，别因为一次保存就永久丢掉
+            old = prev.get(str(it.get("id"))) or {}
+            for key in ("path", "src"):
+                if not it.get(key) and old.get(key):
+                    it[key] = old[key]
+            clean.append(it)
+        items = clean
+    store.save_board(bid, body.name, items, body.edges)
     return {"ok": True}
 
 
@@ -873,9 +1291,11 @@ def api_export_canvas(bid: int, vault: str = ""):
     b = store.board(bid)
     if not b:
         raise HTTPException(404, "画板不存在")
+    b = _mask_hidden_nodes(b)
     if not _items_by_id:
         _refresh()
-    data = board_to_canvas(b, _items_by_id, vault=vault)
+    data = board_to_canvas(b, {k: v for k, v in _items_by_id.items() if not _hidden(v)},
+                           vault=vault)
     payload = json.dumps(data, ensure_ascii=False, indent=1)
     quoted = urllib.parse.quote(f"{b['name']}.canvas")
     return Response(
@@ -920,11 +1340,13 @@ def api_export_board(bid: int, full: bool = False):
     b = store.board(bid)
     if not b:
         raise HTTPException(404, "画板不存在")
+    b = _mask_hidden_nodes(b)
     if not _items_by_id:
         _refresh()
     suffix = "_full" if full else ""
     out = DATA_DIR / f"board_{bid}{suffix}.html"
-    board_to_html(b, _items_by_id, out, full=full)
+    board_to_html(b, {k: v for k, v in _items_by_id.items() if not _hidden(v)},
+                  out, full=full)
     quoted = urllib.parse.quote(f"{b['name']}.html")
     return FileResponse(
         out, headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quoted}"}

@@ -2,6 +2,7 @@
 import base64
 import html
 import mimetypes
+import re
 from pathlib import Path
 
 from .thumbnails import get_thumbnail
@@ -17,6 +18,31 @@ NAI_SAMPLER_MAP = {
 
 # Obsidian Canvas 内置色板（1..6），前端 board.js 用同一套
 CANVAS_COLORS = {"1", "2", "3", "4", "5", "6"}
+
+# 链接节点：内容存成 Markdown 的一行 [名称](地址)，与 board.js 的 LINK_MD_RE 同款
+LINK_MD_RE = re.compile(r"\[([^\]]*)\]\(\s*([^)\s]*)\s*\)")
+
+
+def _link_parts(it: dict) -> tuple:
+    """链接节点 → (名称, 地址)。老数据只有 url 字段，没有 Markdown 正文。"""
+    text = str(it.get("text") or "").replace("\n", " ").strip()
+    m = LINK_MD_RE.search(text)
+    name, url = (m.group(1).strip(), m.group(2).strip()) if m else (text, "")
+    if not m:
+        # 只写了 [名称]（还没填地址）时不要把方括号露出来
+        half = re.match(r"^\[([^\]]*)\]$", text)
+        if half:
+            name = half.group(1).strip()
+    if not url:
+        url = str(it.get("url") or "").strip()
+    return (name or url or "链接"), url
+
+
+def _link_href(url: str) -> str:
+    """没写协议（example.com）时补 https://，与前端 linkHref 一致。"""
+    if not url:
+        return ""
+    return url if re.match(r"^[a-z][a-z0-9+.-]*:", url, re.I) else "https://" + url
 
 
 def to_a1111_text(meta: dict) -> str:
@@ -115,7 +141,7 @@ def board_to_canvas(board: dict, items_by_id: dict, vault: str = "") -> dict:
             node = {"id": it["id"], "type": "file", "file": _canvas_file_ref(ref, vault),
                     "x": pos["x"], "y": pos["y"], "width": pos["w"], "height": pos["h"]}
         elif it.get("type") == "link":
-            node = {"id": it["id"], "type": "link", "url": it.get("url", ""),
+            node = {"id": it["id"], "type": "link", "url": _link_parts(it)[1],
                     "x": pos["x"], "y": pos["y"], "width": pos["w"], "height": pos["h"]}
         elif it.get("type") == "group":
             node = {"id": it["id"], "type": "group", "label": it.get("label", ""),
@@ -228,9 +254,18 @@ def board_to_html(board: dict, items_by_id: dict, out: Path, full: bool = False)
                 f'<div class="{cls.strip()} comfy" style="{style}">'
                 f'<div class="h">{title}</div>{"".join(rows)}</div>')
             continue
-        if it.get("type") in ("link", "group"):
-            label = html.escape(it.get("url") or it.get("label") or "")
-            parts.append(f'<div class="{cls.strip()} txt" style="{style}">🔗 {label}</div>')
+        if it.get("type") == "link":
+            # 与画布上一致：只露名称，地址藏在 href 里
+            name, url = _link_parts(it)
+            href = _link_href(url)
+            body = (f'<a href="{html.escape(href)}" target="_blank" '
+                    f'rel="noopener noreferrer" title="{html.escape(href)}">'
+                    f'{html.escape(name)}</a>') if href else html.escape(name)
+            parts.append(f'<div class="{cls.strip()} txt link" style="{style}">{body}</div>')
+            continue
+        if it.get("type") == "group":
+            label = html.escape(it.get("label") or "")
+            parts.append(f'<div class="{cls.strip()} txt" style="{style}">{label}</div>')
             continue
         info = items_by_id.get(asset_id(it))
         if info:
@@ -295,6 +330,9 @@ html,body{{margin:0;height:100%;overflow:hidden;background:#17171b;
 .item img{{width:100%;height:100%;object-fit:contain;display:block}}
 .item.txt{{padding:12px 14px;white-space:pre-wrap;word-break:break-word;overflow:auto;
   background:#26262e;font-size:13px}}
+.item.txt.link{{display:flex;align-items:center}}
+.item.txt.link a{{color:#e6e6ea;text-decoration:underline;text-underline-offset:3px}}
+.item.txt.link a:hover{{color:#ffd76e}}
 .item.missing{{display:flex;align-items:center;justify-content:center;text-align:center;
   color:#8b8b95;font-size:12px;border-style:dashed;background:#1d1d23}}
 .item.comfy{{padding:0;overflow:auto;background:#202026;font-size:11.5px;

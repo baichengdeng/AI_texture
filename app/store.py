@@ -1,4 +1,4 @@
-"""SQLite 存储：图库根目录 / 收藏 / 标签 / 画板 / 元数据缓存。"""
+"""SQLite 存储：图库根目录 / 收藏 / 标签 / 画板 / 元数据缓存 / 偏好设置。"""
 import json
 import sqlite3
 import threading
@@ -6,7 +6,7 @@ import time
 import uuid
 from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+from .settings import DATA_DIR
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS roots(path TEXT PRIMARY KEY);
@@ -27,7 +27,20 @@ CREATE TABLE IF NOT EXISTS tag_docs(
 CREATE TABLE IF NOT EXISTS seg_templates(
     name TEXT PRIMARY KEY, segs TEXT NOT NULL DEFAULT '[]', updated REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS private_fids(fid TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS private_dirs(path TEXT PRIMARY KEY);
 """
+
+# 偏好设置默认值。新增键直接加在这里，老库不需要迁移。
+# 注意「添加文件夹的方式」不在这里：它每次添加时在弹窗里现选（read / import），
+# 不需要跨次记住，也就没有对应的偏好键。
+SETTING_DEFAULTS = {
+    "undo_limit": 50,          # 画板撤销/重做保留的步数
+    "image_dir": "",           # 内置图片存储位置，空＝data/library
+}
+
+UNDO_MIN, UNDO_MAX = 5, 500
 
 # TAG 分格：一格 = 一个主体名 + 一段自由文本。数量与长度都做上限，
 # 避免 AI 或误操作写进超大 JSON 把库撑坏。
@@ -59,7 +72,7 @@ def clean_segs(raw) -> list:
 
 class Store:
     def __init__(self, db_path: Path = None):
-        DATA_DIR.mkdir(exist_ok=True)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(
             str(db_path or DATA_DIR / "texture.db"), check_same_thread=False
         )
@@ -71,6 +84,80 @@ class Store:
                 self._db.execute("ALTER TABLE boards ADD COLUMN edges TEXT NOT NULL DEFAULT '[]'")
             except sqlite3.OperationalError:
                 pass
+            self._db.commit()
+
+    # ---------- 偏好设置 ----------
+    def settings(self) -> dict:
+        """读全部偏好，缺失的键用默认值补齐。"""
+        with self._lock:
+            rows = self._db.execute("SELECT k, v FROM settings").fetchall()
+        out = dict(SETTING_DEFAULTS)
+        for r in rows:
+            if r["k"] not in out:
+                continue
+            try:
+                out[r["k"]] = json.loads(r["v"])
+            except ValueError:
+                pass
+        return out
+
+    def set_settings(self, updates: dict) -> dict:
+        """写入偏好（只接受已知键，值做范围校验）。返回写入后的完整设置。"""
+        clean = {}
+        for k, v in (updates or {}).items():
+            if k == "undo_limit":
+                try:
+                    n = int(v)
+                except (TypeError, ValueError):
+                    raise ValueError("撤销步数需要是数字")
+                clean[k] = max(UNDO_MIN, min(UNDO_MAX, n))
+            elif k == "image_dir":
+                clean[k] = str(v or "").strip()
+        if clean:
+            with self._lock:
+                for k, v in clean.items():
+                    self._db.execute(
+                        "INSERT OR REPLACE INTO settings(k, v) VALUES (?,?)",
+                        (k, json.dumps(v, ensure_ascii=False)),
+                    )
+                self._db.commit()
+        return self.settings()
+
+    def image_dir(self) -> Path:
+        """内置图片存储位置：偏好值优先，空则用 data/library。"""
+        raw = str(self.settings().get("image_dir") or "").strip()
+        p = Path(raw).expanduser() if raw else DATA_DIR / "library"
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return DATA_DIR / "library"
+        return p
+
+    # ---------- 隐私标记 ----------
+    def private_fids(self) -> set:
+        with self._lock:
+            rows = self._db.execute("SELECT fid FROM private_fids").fetchall()
+        return {r["fid"] for r in rows}
+
+    def private_dirs(self) -> list:
+        with self._lock:
+            rows = self._db.execute("SELECT path FROM private_dirs ORDER BY path").fetchall()
+        return [r["path"] for r in rows]
+
+    def set_private_fid(self, fid: str, value: bool):
+        with self._lock:
+            if value:
+                self._db.execute("INSERT OR IGNORE INTO private_fids(fid) VALUES (?)", (fid,))
+            else:
+                self._db.execute("DELETE FROM private_fids WHERE fid = ?", (fid,))
+            self._db.commit()
+
+    def set_private_dir(self, path: str, value: bool):
+        with self._lock:
+            if value:
+                self._db.execute("INSERT OR IGNORE INTO private_dirs(path) VALUES (?)", (path,))
+            else:
+                self._db.execute("DELETE FROM private_dirs WHERE path = ?", (path,))
             self._db.commit()
 
     # ---------- 根目录 ----------

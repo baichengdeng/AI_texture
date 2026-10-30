@@ -4,11 +4,14 @@
 
 const Hotkeys = (() => {
   const DEFS = [
-    { id: "gallery.panel", label: "快捷键面板",           def: { key: "?" }, scope: "any" },
+    { id: "app.search",    label: "聚焦搜索栏",           def: { key: "?" }, scope: "any" },
+    { id: "app.prefs",     label: "偏好设置",             def: { key: ",", ctrl: true }, scope: "any" },
     { id: "gallery.info",  label: "信息栏 开/收",         def: { key: "i" }, scope: "gallery" },
     { id: "gallery.nav",   label: "侧栏 开/收",           def: { key: "n" }, scope: "gallery" },
     { id: "gallery.all",   label: "全选当前结果",         def: { key: "a", ctrl: true }, scope: "gallery" },
     { id: "gallery.enter", label: "放大当前选中",         def: { key: "Enter" }, scope: "gallery" },
+    { id: "board.undo",    label: "画板：撤销",           def: { key: "z", ctrl: true }, scope: "board" },
+    { id: "board.redo",    label: "画板：重做",           def: { key: "z", ctrl: true, shift: true }, scope: "board" },
     { id: "board.del",     label: "画板：删除选中",       def: { key: "Delete" }, scope: "board" },
     { id: "board.dup",     label: "画板：复制选中",       def: { key: "d", ctrl: true }, scope: "board" },
     { id: "board.text",    label: "画板：新建文本",       def: { key: "t" }, scope: "board" },
@@ -45,7 +48,12 @@ const Hotkeys = (() => {
     if (!b || !b.key) return false;
     if ((ev.ctrlKey || ev.metaKey) !== !!b.ctrl) return false;
     if (ev.altKey !== !!b.alt) return false;
-    if (b.key.length > 1 && ev.shiftKey !== !!b.shift) return false;   // 单字符忽略 Shift（大小写）
+    // 带修饰键的组合必须严格比对 Shift（Ctrl+Z 与 Ctrl+Shift+Z 是两件事）；
+    // 纯单字符（如 ? 需要 Shift+/）忽略 Shift，否则永远按不出来。
+    const strictShift = !!(b.ctrl || b.alt || b.shift);
+    if (strictShift ? ev.shiftKey !== !!b.shift : (b.key.length > 1 && ev.shiftKey !== !!b.shift)) {
+      return false;
+    }
     const k = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
     return k === b.key.toLowerCase();
   }

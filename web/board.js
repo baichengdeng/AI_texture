@@ -88,6 +88,7 @@
     e.from = { node: String(e.from?.node || ""), side: SIDES.includes(e.from?.side) ? e.from.side : "right" };
     e.to = { node: String(e.to?.node || ""), side: SIDES.includes(e.to?.side) ? e.to.side : "left" };
     e.route = ROUTES.includes(e.route) ? e.route : "curve";
+    if (e.dash) e.dash = true;
     return e;
   }
 
@@ -130,6 +131,73 @@
     return out.join("");
   }
 
+  /* ---------- 链接节点 ----------
+     内容就是一行 Markdown：[名称](链接地址)。画布上只显示名称，
+     右侧用竖线切出「打开」按钮，点了才跳到网页。 */
+  const LINK_MD_RE = /\[([^\]]*)\]\(\s*([^)\s]*)\s*\)/;
+
+  function parseLinkSource(source) {
+    const raw = String(source == null ? "" : source).replace(/\s*\n\s*/g, " ").trim();
+    const m = raw.match(LINK_MD_RE);
+    if (m) return { name: m[1].trim(), url: m[2].trim() };
+    // 正在输入 [名称]( 时先只显示名称，不至于把方括号露在卡片上
+    const partial = raw.match(/^\[([^\]]*)\]/);
+    if (partial) return { name: partial[1].trim(), url: "" };
+    // 只写了网址也认：名称用去掉协议的地址
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) || /^www\./i.test(raw)) {
+      return { name: raw.replace(/^[a-z][a-z0-9+.-]*:\/\//i, ""), url: raw };
+    }
+    return { name: raw, url: "" };
+  }
+
+  // 老数据只有 url 字段，补成 Markdown 后走同一套解析
+  function linkSourceOf(node) {
+    const text = String(node.text || "").trim();
+    if (text) return text;
+    const url = String(node.url || "").trim();
+    return url ? `[${url}](${url})` : "";
+  }
+
+  function linkInfo(node) {
+    const info = parseLinkSource(linkSourceOf(node));
+    if (!info.url) {
+      const legacy = String(node.url || "").trim();
+      if (legacy) info.url = legacy;
+    }
+    if (!info.name) info.name = info.url || "未命名链接";
+    return info;
+  }
+
+  function linkHref(node) {
+    const url = linkInfo(node).url.trim();
+    if (!url) return "";
+    return /^[a-z][a-z0-9+.-]*:/i.test(url) ? url : "https://" + url;
+  }
+
+  function openLinkNode(node) {
+    const href = linkHref(node);
+    if (!href) {
+      toast("这个链接还没写地址，在右侧填 [名称](链接地址)");
+      return;
+    }
+    window.open(href, "_blank", "noopener,noreferrer");
+  }
+
+  function linkNodeHTML(it) {
+    const info = linkInfo(it);
+    const href = linkHref(it);
+    return `<div class="b-link-body${href ? "" : " is-empty"}">
+        <span class="b-link-name" title="${esc(href || info.name)}">${esc(info.name)}</span>
+        <button type="button" class="b-link-go${href ? "" : " is-off"}"
+          aria-label="打开链接" aria-disabled="${href ? "false" : "true"}"
+          title="${esc(href || "未设置链接地址")}">
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M9.2 2.8h4v4M13.2 2.8 7.6 8.4M11.4 9.2V12a1.6 1.6 0 0 1-1.6 1.6H4.2A1.6 1.6 0 0 1 2.6 12V6.4A1.6 1.6 0 0 1 4.2 4.8H6"/>
+          </svg>
+        </button>
+      </div>`;
+  }
+
   const FONT_FAMILY = {
     sans: 'var(--font-text)',
     serif: '"Songti SC", "SimSun", "Noto Serif SC", serif',
@@ -138,7 +206,7 @@
 
   function nodeTextTargets(el) {
     return el.querySelectorAll(
-      ".b-text-body, .b-md-body, .b-group-label, .b-link, .b-comfy-body");
+      ".b-text-body, .b-md-body, .b-group-label, .b-link-name, .b-comfy-body");
   }
 
   function applyNodeTextStyle(it, el) {
@@ -153,7 +221,7 @@
 
   function nodeTitle(node) {
     if (node.type === "group") return node.label || "分组";
-    if (node.type === "link") return node.url || "链接";
+    if (node.type === "link") return linkInfo(node).name || "链接";
     if (node.type === "comfy") return node.title || "ComfyUI 节点";
     const first = String(node.text || "").split("\n").find((s) => s.trim()) || "";
     return first.replace(/^#{1,6}\s*/, "").slice(0, 60) ||
@@ -173,6 +241,23 @@
     const r = wrap.getBoundingClientRect();
     return { x: (cx - r.left - board.panX) / board.scale, y: (cy - r.top - board.panY) / board.scale };
   };
+
+  /* 兜底清残留：画布把子节点画到自身盒子之外（世界坐标可以任意远），
+     一次手势里成百上千次改 transform / left / top，个别帧的旧栅格
+     Chromium 会算漏，留下孤立的 1px 细线。手势结束时把画布临时提成
+     独立图层再放下，等于强制整层重新栅格化一次，只占一帧。
+     连续手势中只排一次，避免每帧都提层。 */
+  let flushRaf = 0;
+  function flushPaint() {
+    if (flushRaf) return;
+    flushRaf = requestAnimationFrame(() => {
+      canvas.style.willChange = "transform";
+      flushRaf = requestAnimationFrame(() => {
+        canvas.style.willChange = "";
+        flushRaf = 0;
+      });
+    });
+  }
 
   let viewTimer = null;
   function saveViewportSoon() {
@@ -227,6 +312,7 @@
       board.panY = (r.height - bh * s) / 2 - minY * s;
     }
     applyTransform(); updateSelToolbar(); applyImgSrc();
+    flushPaint();
   }
 
   /* 把某个节点放到视口中央（按给定比例）。节点图导入后用它落在可读比例上，
@@ -242,6 +328,7 @@
     applyTransform();
     updateSelToolbar();
     applyImgSrc();
+    flushPaint();
     return true;
   }
 
@@ -256,13 +343,6 @@
       left: { x: n.x, y: n.y + n.h / 2 },
       right: { x: n.x + n.w, y: n.y + n.h / 2 },
     }[side] || { x: n.x + n.w / 2, y: n.y + n.h / 2 };
-  }
-
-  function ctrlPoint(p, side, h) {
-    if (side === "left") return { x: p.x - h, y: p.y };
-    if (side === "right") return { x: p.x + h, y: p.y };
-    if (side === "top") return { x: p.x, y: p.y - h };
-    return { x: p.x, y: p.y + h };
   }
 
   /* 折线的中点：按长度走到一半，标签就放在这里 */
@@ -290,92 +370,206 @@
     return pts[pts.length - 1];
   }
 
-  /* 去掉重复点与「三点共线」的中间点，路径干净，也少几个 DOM 属性数字 */
-  function dedupePts(pts) {
-    const out = pts.filter((p, i) =>
-      i === 0 || Math.abs(p.x - pts[i - 1].x) > 0.01 || Math.abs(p.y - pts[i - 1].y) > 0.01);
-    return out.filter((p, i) => {
-      if (i === 0 || i === out.length - 1) return true;
-      const a = out[i - 1], b = out[i + 1];
-      const cross = (p.x - a.x) * (b.y - p.y) - (p.y - a.y) * (b.x - p.x);
-      return Math.abs(cross) > 0.01;
-    });
-  }
-
-  /* 90° 直角：两端各走一小段出口（stub），中间按两边朝向补拐点 */
-  function orthoRaw(p1, s1, p2, s2) {
-    const stub = 22;
-    const d1 = SIDE_DIR[s1] || SIDE_DIR.right;
-    const d2 = SIDE_DIR[s2] || SIDE_DIR.left;
-    const a = { x: p1.x + d1.x * stub, y: p1.y + d1.y * stub };
-    const b = { x: p2.x + d2.x * stub, y: p2.y + d2.y * stub };
-    const h1 = d1.x !== 0, h2 = d2.x !== 0;
-    const pts = [p1, a];
-    if (h1 && h2) {
-      const mx = (a.x + b.x) / 2;
-      pts.push({ x: mx, y: a.y }, { x: mx, y: b.y });
-    } else if (!h1 && !h2) {
-      const my = (a.y + b.y) / 2;
-      pts.push({ x: a.x, y: my }, { x: b.x, y: my });
-    } else if (h1) {
-      pts.push({ x: b.x, y: a.y });
-    } else {
-      pts.push({ x: a.x, y: b.y });
-    }
-    pts.push(b, p2);
-    return pts;
-  }
-
-  function orthoPoints(p1, s1, p2, s2) {
-    return dedupePts(orthoRaw(p1, s1, p2, s2));
-  }
-
-  /* 45° 折角：从两端出口点之间插一段斜线，其余仍走直角 */
-  function diagPoints(p1, s1, p2, s2) {
-    const raw = orthoRaw(p1, s1, p2, s2);
-    const start = raw[1];
-    const end = raw[raw.length - 2];
-    const dx = end.x - start.x, dy = end.y - start.y;
-    const L = Math.min(Math.abs(dx), Math.abs(dy));
-    if (L < 6) return dedupePts(raw);          // 几乎对齐，斜不出来
-    const m = { x: start.x + Math.sign(dx) * L, y: start.y + Math.sign(dy) * L };
-    return dedupePts([p1, start, m, end, p2]);
-  }
-
   const ptsToPath = (pts) =>
     pts.map((p, i) => `${i ? "L" : "M"} ${Math.round(p.x * 100) / 100} ${Math.round(p.y * 100) / 100}`)
       .join(" ");
+
+  /* ---------- 走线几何（照 reactflow 的三个函数搬） ----------
+     reactflow 把每条边当成一条三次贝塞尔：两端各有一个控制点，沿出口方向伸出
+     「两端距离的一半」；目标在源的背后（距离为负）时改用 curvature*25*√距离，
+     所以往回绕的连线不会甩出一大圈。直角走线用圆角折线（smoothstep），
+     拐角半径按相邻两段长度的一半收，短段也不会画崩。 */
+
+  const RF_CURVATURE = 0.25;
+
+  function controlOffset(distance, curvature) {
+    return distance >= 0 ? 0.5 * distance : curvature * 25 * Math.sqrt(-distance);
+  }
+
+  function controlWithCurvature(side, x1, y1, x2, y2, c) {
+    if (side === "left") return [x1 - controlOffset(x1 - x2, c), y1];
+    if (side === "right") return [x1 + controlOffset(x2 - x1, c), y1];
+    if (side === "top") return [x1, y1 - controlOffset(y1 - y2, c)];
+    return [x1, y1 + controlOffset(y2 - y1, c)];
+  }
+
+  /* getBezierPath：标签用曲线 t=0.5 的位置，视觉上比真实中点更贴线 */
+  function bezierPath(p1, s1, p2, s2) {
+    const [c1x, c1y] = controlWithCurvature(s1, p1.x, p1.y, p2.x, p2.y, RF_CURVATURE);
+    const [c2x, c2y] = controlWithCurvature(s2, p2.x, p2.y, p1.x, p1.y, RF_CURVATURE);
+    return {
+      d: `M ${p1.x} ${p1.y} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${p2.x} ${p2.y}`,
+      mid: {
+        x: p1.x * 0.125 + c1x * 0.375 + c2x * 0.375 + p2.x * 0.125,
+        y: p1.y * 0.125 + c1y * 0.375 + c2y * 0.375 + p2.y * 0.125,
+      },
+    };
+  }
+
+  const dist2 = (a, b) => Math.hypot(b.x - a.x, b.y - a.y);
+
+  /* b 正好落在 a→c 的直线上（含与 c 重合），中间点可以删掉 */
+  function isBetween(a, b, c) {
+    return (a.x === b.x && b.x === c.x && (b.y - a.y) * (c.y - b.y) >= 0) ||
+      (a.y === b.y && b.y === c.y && (b.x - a.x) * (c.x - b.x) >= 0);
+  }
+
+  /* getPoints：先把两端各退 offset，再按两端的朝向补一两个拐点 */
+  function smoothPoints(p1, s1, p2, s2, offset = 20, stepPosition = 0.5) {
+    const sd = SIDE_DIR[s1] || SIDE_DIR.right;
+    const td = SIDE_DIR[s2] || SIDE_DIR.left;
+    const sg = { x: p1.x + sd.x * offset, y: p1.y + sd.y * offset };
+    const tg = { x: p2.x + td.x * offset, y: p2.y + td.y * offset };
+    const dir = (s1 === "left" || s1 === "right")
+      ? (sg.x < tg.x ? { x: 1, y: 0 } : { x: -1, y: 0 })
+      : (sg.y < tg.y ? { x: 0, y: 1 } : { x: 0, y: -1 });
+    const ax = dir.x !== 0 ? "x" : "y";
+    const currDir = dir[ax];
+
+    let points = [];
+    let centerX, centerY;
+    const sgo = { x: 0, y: 0 }, tgo = { x: 0, y: 0 };
+
+    if (sd[ax] * td[ax] === -1) {
+      if (ax === "x") {
+        centerX = sg.x + (tg.x - sg.x) * stepPosition;
+        centerY = (sg.y + tg.y) / 2;
+      } else {
+        centerX = (sg.x + tg.x) / 2;
+        centerY = sg.y + (tg.y - sg.y) * stepPosition;
+      }
+      const verticalSplit = [{ x: centerX, y: sg.y }, { x: centerX, y: tg.y }];
+      const horizontalSplit = [{ x: sg.x, y: centerY }, { x: tg.x, y: centerY }];
+      if (sd[ax] === currDir) points = ax === "x" ? verticalSplit : horizontalSplit;
+      else points = ax === "x" ? horizontalSplit : verticalSplit;
+    } else {
+      const sourceTarget = [{ x: sg.x, y: tg.y }];
+      const targetSource = [{ x: tg.x, y: sg.y }];
+      points = ax === "x"
+        ? (sd.x === currDir ? targetSource : sourceTarget)
+        : (sd.y === currDir ? sourceTarget : targetSource);
+
+      if (s1 === s2) {
+        // 同侧出线（右→右）距离太近时，拐点会和退后的端点重叠
+        const diff = Math.abs(p1[ax] - p2[ax]);
+        if (diff <= offset) {
+          const gapOffset = Math.min(offset - 1, offset - diff);
+          if (sd[ax] === currDir) sgo[ax] = (sg[ax] > p1[ax] ? -1 : 1) * gapOffset;
+          else tgo[ax] = (tg[ax] > p2[ax] ? -1 : 1) * gapOffset;
+        }
+      }
+      if (s1 !== s2) {
+        // 混合朝向（右→下 之类）：判断该从源还是从目标绕
+        const opp = ax === "x" ? "y" : "x";
+        const sameDir = sd[ax] === td[opp];
+        const gt = sg[opp] > tg[opp];
+        const lt = sg[opp] < tg[opp];
+        const flip = (sd[ax] === 1 && ((!sameDir && gt) || (sameDir && lt))) ||
+          (sd[ax] !== 1 && ((!sameDir && lt) || (sameDir && gt)));
+        if (flip) points = ax === "x" ? sourceTarget : targetSource;
+      }
+      const sgp = { x: sg.x + sgo.x, y: sg.y + sgo.y };
+      const tgp = { x: tg.x + tgo.x, y: tg.y + tgo.y };
+      const maxX = Math.max(Math.abs(sgp.x - points[0].x), Math.abs(tgp.x - points[0].x));
+      const maxY = Math.max(Math.abs(sgp.y - points[0].y), Math.abs(tgp.y - points[0].y));
+      if (maxX >= maxY) { centerX = (sgp.x + tgp.x) / 2; centerY = points[0].y; }
+      else { centerX = points[0].x; centerY = (sgp.y + tgp.y) / 2; }
+    }
+
+    const gs = { x: sg.x + sgo.x, y: sg.y + sgo.y };
+    const gt = { x: tg.x + tgo.x, y: tg.y + tgo.y };
+    const pts = [];
+    for (const point of [p1, gs, ...points, gt, p2]) {
+      if (pts.length >= 2 && isBetween(pts[pts.length - 2], pts[pts.length - 1], point)) pts.pop();
+      pts.push(point);
+    }
+    return { pts, mid: { x: centerX, y: centerY } };
+  }
+
+  /* getBend：拐角用一小段二次曲线圆过去，半径不超过相邻两段的一半 */
+  function bend(a, b, c, size) {
+    const bendSize = Math.min(dist2(a, b) / 2, dist2(b, c) / 2, size);
+    const { x, y } = b;
+    if ((a.x === x && x === c.x) || (a.y === y && y === c.y)) return `L${x} ${y}`;
+    if (a.y === y) {
+      const xDir = a.x < c.x ? -1 : 1;
+      const yDir = a.y < c.y ? 1 : -1;
+      return `L ${x + bendSize * xDir},${y}Q ${x},${y} ${x},${y + bendSize * yDir}`;
+    }
+    const xDir = a.x < c.x ? 1 : -1;
+    const yDir = a.y < c.y ? -1 : 1;
+    return `L ${x},${y + bendSize * yDir}Q ${x},${y} ${x + bendSize * xDir},${y}`;
+  }
+
+  function smoothPath(p1, s1, p2, s2, radius = 8) {
+    const { pts, mid } = smoothPoints(p1, s1, p2, s2);
+    let d = `M${pts[0].x} ${pts[0].y}`;
+    for (let i = 1; i < pts.length - 1; i++) d += bend(pts[i - 1], pts[i], pts[i + 1], radius);
+    d += `L${pts[pts.length - 1].x} ${pts[pts.length - 1].y}`;
+    return { d, mid };
+  }
+
+  /* 任意角度折线的圆角：在拐点两边各退一小段，用二次曲线补上。
+     bend() 只认 90° 拐角（判 a.y===y / a.x===x），45° 斜段接进来会画歪，所以另写一个。 */
+  function roundPoly(pts, radius = 7) {
+    if (pts.length < 3) return ptsToPath(pts);
+    let d = `M${pts[0].x} ${pts[0].y}`;
+    for (let i = 1; i < pts.length - 1; i++) {
+      const a = pts[i - 1], b = pts[i], c = pts[i + 1];
+      const l1 = dist2(a, b), l2 = dist2(b, c);
+      if (l1 < 0.01 || l2 < 0.01) { d += `L${b.x} ${b.y}`; continue; }
+      const r = Math.min(radius, l1 / 2, l2 / 2);
+      const p = { x: b.x + ((a.x - b.x) / l1) * r, y: b.y + ((a.y - b.y) / l1) * r };
+      const q = { x: b.x + ((c.x - b.x) / l2) * r, y: b.y + ((c.y - b.y) / l2) * r };
+      d += `L${p.x} ${p.y}Q${b.x} ${b.y} ${q.x} ${q.y}`;
+    }
+    d += `L${pts[pts.length - 1].x} ${pts[pts.length - 1].y}`;
+    return d;
+  }
+
+  /* 45° 折角：直出 → 沿轴平移 → 45° 斜段 → 沿轴入线。
+     斜段在 x、y 上的投影都取 |dx| 与 |dy| 中较小的那个，所以一定正好 45°，
+     且两端都能接到轴上（先沿较长的那个方向走，剩下的交给斜段）。
+     早先的实现只取平滑折线的中间两个点，竖直那段的 dx 恒为 0，于是每次都退化成直角。 */
+  function diagPath(p1, s1, p2, s2, stub = 20, radius = 7) {
+    const sd = SIDE_DIR[s1] || SIDE_DIR.right;
+    const td = SIDE_DIR[s2] || SIDE_DIR.left;
+    const s = { x: p1.x + sd.x * stub, y: p1.y + sd.y * stub };
+    const t = { x: p2.x + td.x * stub, y: p2.y + td.y * stub };
+    const dx = t.x - s.x, dy = t.y - s.y;
+    const pts = [p1, s];
+    if (Math.abs(dx) >= Math.abs(dy)) {
+      // 先横着走一段，再 45° 收口
+      const mx = s.x + dx - Math.sign(dx) * Math.abs(dy);
+      if (Math.abs(mx - s.x) > 0.5) pts.push({ x: mx, y: s.y });
+    } else {
+      // 竖直落差更大：先竖着走一段，再 45° 收口
+      const my = s.y + dy - Math.sign(dy) * Math.abs(dx);
+      if (Math.abs(my - s.y) > 0.5) pts.push({ x: s.x, y: my });
+    }
+    pts.push(t, p2);
+    const clean = [];
+    for (const q of pts) {
+      const last = clean[clean.length - 1];
+      if (!last || Math.hypot(q.x - last.x, q.y - last.y) > 0.5) clean.push(q);
+    }
+    return { d: roundPoly(clean, radius), mid: polyMid(clean) };
+  }
 
   function edgeGeometry(e) {
     const a = nodeById(e.from.node), b = nodeById(e.to.node);
     if (!a || !b) return null;
     const p1 = anchorPos(a, e.from.side), p2 = anchorPos(b, e.to.side);
     const route = ROUTES.includes(e.route) ? e.route : "curve";
-
     if (route === "line") {
       return {
         d: `M ${p1.x} ${p1.y} L ${p2.x} ${p2.y}`,
         mid: { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 },
       };
     }
-    if (route === "ortho" || route === "diag") {
-      const pts = route === "ortho"
-        ? orthoPoints(p1, e.from.side, p2, e.to.side)
-        : diagPoints(p1, e.from.side, p2, e.to.side);
-      return { d: ptsToPath(pts), mid: polyMid(pts) };
-    }
-
-    const dx = Math.abs(p2.x - p1.x), dy = Math.abs(p2.y - p1.y);
-    const horiz = e.from.side === "left" || e.from.side === "right";
-    const h = Math.max(40, (horiz ? dx : dy) * 0.5);
-    const c1 = ctrlPoint(p1, e.from.side, h), c2 = ctrlPoint(p2, e.to.side, h);
-    return {
-      d: `M ${p1.x} ${p1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${p2.x} ${p2.y}`,
-      mid: {
-        x: (p1.x + 3 * c1.x + 3 * c2.x + p2.x) / 8,
-        y: (p1.y + 3 * c1.y + 3 * c2.y + p2.y) / 8,
-      },
-    };
+    if (route === "ortho") return smoothPath(p1, e.from.side, p2, e.to.side);
+    if (route === "diag") return diagPath(p1, e.from.side, p2, e.to.side);
+    return bezierPath(p1, e.from.side, p2, e.to.side);
   }
 
   /* ---------- 保存：revision 机制，保存期间的新改动不会被误标已保存 ---------- */
@@ -396,6 +590,7 @@
     setStatus("未保存");
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => save(), 900);
+    scheduleCommit();
   }
 
   async function save(force = false) {
@@ -442,6 +637,92 @@
     }
   }
 
+  /* ---------- 撤销 / 重做 ----------
+     快照式：把 {items, edges} 存成 JSON。markDirty 之后延迟 420ms 提交一次，
+     所以一次拖拽、一段连续输入都只算一步（不会退回到每个像素）。
+     步数上限来自偏好设置（默认 50，5–500）。 */
+  let undoStack = [];
+  let redoStack = [];
+  let lastSnap = "";
+  let snapTimer = null;
+  let applying = false;
+
+  const snapNow = () => JSON.stringify({ items: board.items, edges: board.edges });
+  const undoLimit = () => {
+    const n = Number(window.TEXTURE_SETTINGS?.undoLimit);
+    return Number.isFinite(n) ? Math.max(5, Math.min(500, n)) : 50;
+  };
+
+  function updateUndoUI() {
+    const u = $("#board-undo"), r = $("#board-redo");
+    if (u) u.disabled = !undoStack.length;
+    if (r) r.disabled = !redoStack.length;
+  }
+
+  function resetHistory() {
+    clearTimeout(snapTimer);
+    snapTimer = null;
+    undoStack = [];
+    redoStack = [];
+    lastSnap = board.id == null ? "" : snapNow();
+    updateUndoUI();
+  }
+
+  function commitHistory() {
+    clearTimeout(snapTimer);
+    snapTimer = null;
+    if (applying || board.id == null) return;
+    const cur = snapNow();
+    if (!lastSnap) { lastSnap = cur; return; }
+    if (cur === lastSnap) return;
+    undoStack.push(lastSnap);
+    const max = undoLimit();
+    while (undoStack.length > max) undoStack.shift();
+    redoStack = [];
+    lastSnap = cur;
+    updateUndoUI();
+  }
+
+  function scheduleCommit() {
+    if (applying) return;
+    clearTimeout(snapTimer);
+    snapTimer = setTimeout(commitHistory, 420);
+  }
+
+  function applySnapshot(json) {
+    applying = true;
+    try {
+      const data = JSON.parse(json);
+      board.items = (data.items || []).map(normalizeNode);
+      board.edges = (data.edges || []).map(normalizeEdge);
+      selection = { nodes: new Set(), edges: new Set() };
+      render();
+      markDirty();
+      lastSnap = snapNow();
+    } finally {
+      applying = false;
+    }
+    updateUndoUI();
+  }
+
+  function undo() {
+    commitHistory();
+    if (!undoStack.length) { toast("没有可撤销的操作"); return; }
+    const prev = undoStack.pop();
+    redoStack.push(snapNow());
+    applySnapshot(prev);
+    toast("已撤销");
+  }
+
+  function redo() {
+    commitHistory();
+    if (!redoStack.length) { toast("没有可重做的操作"); return; }
+    const next = redoStack.pop();
+    undoStack.push(snapNow());
+    applySnapshot(next);
+    toast("已重做");
+  }
+
   /* ---------- 选中 ---------- */
   function syncSelection() {
     canvas.querySelectorAll(".b-item").forEach((el) =>
@@ -449,6 +730,9 @@
     canvas.querySelectorAll("g[data-edge]").forEach((g) =>
       g.classList.toggle("selected", selection.edges.has(g.dataset.edge)));
     updateSelToolbar();
+    // 多选时信息栏报总数；退回单选/空选就把多选面板收起
+    if (selection.nodes.size > 1) window.updateBoardMultiCount?.(selection.nodes.size);
+    else window.hideBoardMultiInspector?.();
   }
 
   function clearSelection() {
@@ -479,6 +763,7 @@
       edges: new Set(board.edges.map((e) => e.id)),
     };
     syncSelection();
+    if (selection.nodes.size > 1) window.showBoardMultiInspector?.(selection.nodes.size);
   }
 
   function selectionBBox() {
@@ -509,6 +794,12 @@
     const bar = $("#sel-toolbar");
     const total = selection.nodes.size + selection.edges.size;
     bar.hidden = total === 0;
+    // 多选时把数量亮出来，省得「到底选上了没有」全靠猜
+    const cnt = $("#sel-count-node");
+    if (cnt) {
+      cnt.hidden = total < 2;
+      cnt.textContent = total >= 2 ? `已选 ${total} 项` : "";
+    }
     $("#sel-label").hidden = selection.edges.size === 0;
     if (!total) {
       $("#style-pop").hidden = true;
@@ -610,9 +901,15 @@ function comfyNodeHTML(it) {
     } else if (it.type === "comfy") {
       el.innerHTML = comfyNodeHTML(it);
     } else if (it.type === "link") {
-      el.innerHTML = `<div class="b-link"><span>↗</span><span>${esc(it.url || "")}</span></div>`;
+      el.innerHTML = linkNodeHTML(it);
     } else if (it.type === "group") {
-      el.innerHTML = `<div class="b-group-label">${esc(it.label || "分组")}</div>`;
+      // 标题单独占一格：和内容分开，只有这一格是「把手」
+      el.innerHTML = `<div class="b-group-head"><span class="b-group-label">` +
+        `${esc(it.label || "分组")}</span></div><div class="b-group-body"></div>`;
+    } else if (it.hidden) {
+      // 隐私模式关着：节点留着，内容换成占位，开回来自己就出现
+      el.classList.add("is-private");
+      el.innerHTML = `<div class="b-private"><span class="bp-en">Private</span><span class="bp-zh">内容已隐藏</span></div>`;
     } else if (!it.fileId) {
       el.innerHTML = `<div class="b-missing">图片缺失<br><span>${esc(baseName(it.path || it.src || ""))}</span></div>`;
     } else {
@@ -667,17 +964,26 @@ function comfyNodeHTML(it) {
     const vis = document.createElementNS(svgNS, "path");
     vis.setAttribute("class", "edge-line");
     vis.setAttribute("d", geo.d);
+    if (e.dash) vis.setAttribute("stroke-dasharray", "7 5");
     if (e.toEnd === "arrow") vis.setAttribute("marker-end", `url(#ea-${suffix})`);
     if (e.fromEnd === "arrow") vis.setAttribute("marker-start", `url(#eas-${suffix})`);
     g.appendChild(hit);
     g.appendChild(vis);
     if (e.label) {
+      // 标签做成一个真正的文字框：底 + 边 + 内边距，尺寸按文字实际外框量（见 fitEdgeLabel）
+      const lg = document.createElementNS(svgNS, "g");
+      lg.setAttribute("class", "edge-label-g");
+      lg.setAttribute("transform", `translate(${geo.mid.x} ${geo.mid.y})`);
+      const box = document.createElementNS(svgNS, "rect");
+      box.setAttribute("class", "edge-label-box");
       const t = document.createElementNS(svgNS, "text");
       t.setAttribute("class", "edge-label");
-      t.setAttribute("x", geo.mid.x);
-      t.setAttribute("y", geo.mid.y);
+      t.setAttribute("x", "0");
+      t.setAttribute("y", "0");
       t.textContent = e.label;
-      g.appendChild(t);
+      lg.appendChild(box);
+      lg.appendChild(t);
+      g.appendChild(lg);
     }
     g.addEventListener("mousedown", (ev) => {
       if (ev.button !== 0) return;
@@ -702,14 +1008,33 @@ function comfyNodeHTML(it) {
     return g;
   }
 
+  /* 量一次文字的实际外框，把底框撑到文字四周留出内边距。
+     必须在元素已经挂进文档后调用（getBBox 对游离节点无效）。 */
+  const EDGE_LABEL_PAD_X = 6;
+  const EDGE_LABEL_PAD_Y = 3;
+  function fitEdgeLabel(g) {
+    const lg = g.querySelector(".edge-label-g");
+    if (!lg) return;
+    const t = lg.querySelector(".edge-label");
+    const box = lg.querySelector(".edge-label-box");
+    if (!t || !box) return;
+    let bb;
+    try { bb = t.getBBox(); } catch { return; }
+    if (!bb || !bb.width) return;
+    box.setAttribute("x", bb.x - EDGE_LABEL_PAD_X);
+    box.setAttribute("y", bb.y - EDGE_LABEL_PAD_Y);
+    box.setAttribute("width", bb.width + EDGE_LABEL_PAD_X * 2);
+    box.setAttribute("height", bb.height + EDGE_LABEL_PAD_Y * 2);
+  }
+
   function redrawEdges() {
     canvas.querySelectorAll("g[data-edge]").forEach((g) => {
       const e = edgeById(g.dataset.edge);
       const geo = e && edgeGeometry(e);
       if (!geo) return;
       g.querySelectorAll("path").forEach((p) => p.setAttribute("d", geo.d));
-      const label = g.querySelector(".edge-label");
-      if (label) { label.setAttribute("x", geo.mid.x); label.setAttribute("y", geo.mid.y); }
+      const lg = g.querySelector(".edge-label-g");
+      if (lg) lg.setAttribute("transform", `translate(${geo.mid.x} ${geo.mid.y})`);
     });
   }
 
@@ -736,6 +1061,8 @@ function comfyNodeHTML(it) {
       if (g) svg.appendChild(g);
     }
     canvas.appendChild(svg);
+    // 标签框要等 SVG 进文档后才有 BBox 可量
+    svg.querySelectorAll("g[data-edge]").forEach(fitEdgeLabel);
     // 组永远先渲染，作为背景容器；普通节点后渲染，保证组内节点可选中。
     const groups = board.items.filter((n) => n.type === "group");
     const normal = board.items.filter((n) => n.type !== "group");
@@ -744,6 +1071,7 @@ function comfyNodeHTML(it) {
     applyTransform();
     updateSelToolbar();
     applyImgSrc();
+    flushPaint();          // 整层重建后清一次，防止旧走线栅格留在底纹上
   }
 
   /* ---------- 节点交互 ---------- */
@@ -754,10 +1082,25 @@ function comfyNodeHTML(it) {
       const label = el?.querySelector(".b-group-label");
       if (label) label.textContent = value;
     } else if (it.type === "link") {
-      it.url = value;
-      const el = nodeEl(it.id);
-      const link = el?.querySelector(".b-link > span:last-child");
-      if (link) link.textContent = value;
+      it.text = String(value || "");
+      const info = linkInfo(it);
+      it.url = info.url;
+      const href = linkHref(it);
+      const body = nodeEl(it.id)?.querySelector(".b-link-body");
+      if (body) {
+        body.classList.toggle("is-empty", !href);
+        const name = body.querySelector(".b-link-name");
+        if (name) {
+          name.textContent = info.name;
+          name.title = href || info.name;
+        }
+        const go = body.querySelector(".b-link-go");
+        if (go) {
+          go.classList.toggle("is-off", !href);
+          go.setAttribute("aria-disabled", href ? "false" : "true");
+          go.title = href || "未设置链接地址";
+        }
+      }
     } else if (it.type === "md") {
       it.text = value;
       const body = nodeEl(it.id)?.querySelector(".b-md-body");
@@ -773,7 +1116,13 @@ function comfyNodeHTML(it) {
 
   function previewNode(it) {
     if (!it) return;
+    // 多选时别假装只选了这一个：信息栏改成「已选 N 项」
+    if (selection.nodes.size > 1) {
+      window.showBoardMultiInspector?.(selection.nodes.size);
+      return;
+    }
     if (it.type === "image" && it.fileId) {
+      if (it.hidden) { window.showPrivateInspector?.(); return; }
       if (typeof selectImage === "function") selectImage(it.fileId);
       if (typeof setInspector === "function") setInspector(true);
       return;
@@ -789,7 +1138,7 @@ function comfyNodeHTML(it) {
         render();
         window.hideBoardNodeInspector?.();
         const empty = $("#insp-empty");
-        if (empty) { empty.hidden = false; empty.textContent = "点画布上的图片、文字或 Markdown 节点，这里显示内容与参数。"; }
+        if (empty) { empty.hidden = false; empty.textContent = "未选择节点"; }
       },
       onDuplicate: () => {
         selection = { nodes: new Set([it.id]), edges: new Set() };
@@ -800,16 +1149,32 @@ function comfyNodeHTML(it) {
   }
 
   function bindNode(el, it) {
+    el.addEventListener("click", (ev) => {
+      const go = ev.target.closest(".b-link-go");
+      if (!go) return;
+      ev.stopPropagation();
+      ev.preventDefault();
+      openLinkNode(it);
+    });
+
     el.addEventListener("mousedown", (ev) => {
       if (ev.button !== 0) return;
       if (spaceDown) return;                 // 空格按住时交给画布平移
+      const additive = ev.ctrlKey || ev.metaKey || ev.shiftKey;
       if (editingText === it.id) {
         // 点在编辑框里：交给浏览器放光标；点在框外：结束编辑再照常处理
         if (ev.target.closest(".b-text-body, .b-md-body")) return;
         stopTextEdit();
       }
-      if (ev.target.classList.contains("anchor")) {
+      // 锚点有一半压在节点边上，按着 Ctrl/Shift 点时优先当「加选」，不然多选会被它挡住
+      if (ev.target.classList.contains("anchor") && !additive) {
         startLink(ev, it, ev.target.dataset.side);
+        return;
+      }
+      // 链接按钮：不选中、不拖动，留给 click 打开网页
+      if (ev.target.closest(".b-link-go")) {
+        ev.stopPropagation();
+        ev.preventDefault();
         return;
       }
       // 缺角就是「固定」开关：把手没弹出时才可点，弹出后那个位置让给缩放把手
@@ -821,14 +1186,44 @@ function comfyNodeHTML(it) {
         return;
       }
       ev.stopPropagation();
-      const additive = ev.ctrlKey || ev.metaKey || ev.shiftKey;
+
+      /* 拖动要先「选中」——
+         组：标题格永远是把手，选中后整块都能拖；
+         其他节点：第一次按下只负责选中，第二次按下才是移动。
+         未选中的组，按在它身上等同按在空白画布（清选 + 框选），
+         这样组里那块空地还能用来框选。 */
+      const isGroup = it.type === "group";
+      const dir = ev.target.dataset ? (ev.target.dataset.dir || "") : "";
+      // 标题格是把手；上边缘那条 8px 热区也归它，别让组顶边一按就变成框选
+      const onHead = !!ev.target.closest(".b-group-head") ||
+        (isGroup && dir.includes("n"));
+      const chosen = selection.nodes.has(it.id);
+
+      if (isGroup && !chosen && !onHead && !additive) {
+        clearSelection();
+        startMarquee(ev);
+        return;
+      }
+
       if (additive) {
         selectNode(it.id, true);
         previewNode(it);
         return;
       }
-      if (!selection.nodes.has(it.id)) selectNode(it.id);
-      previewNode(it);
+      if (!chosen) {
+        selectNode(it.id);
+        previewNode(it);
+        if (!onHead) return;      // 普通节点：这一次只是选中，不动位置
+      } else {
+        previewNode(it);
+      }
+      // 标题格优先于缩放手柄：组的顶边整个被标题格占着，画布一缩小，
+      // 标题格比 16px 的热区还矮，一按必然先碰到 .rz-n。按标题格就该
+      // 拖动整组，不能变成缩放。
+      if (onHead) {
+        startMove(ev);
+        return;
+      }
       if (ev.target.classList.contains("rz")) {
         // 单选才缩放；多选/无独占选中时抓到把手不吞事件，照常整组移动
         if (selection.nodes.size === 1) startResize(ev, it, el, ev.target.dataset.dir || "se");
@@ -838,7 +1233,7 @@ function comfyNodeHTML(it) {
       startMove(ev);
     });
 
-    el.addEventListener("dblclick", (ev) => {
+    el.addEventListener("dblclick", async (ev) => {
       ev.stopPropagation();
       // 双击即选中并同步右侧介绍栏，避免"在改 A、侧栏还是 B"
       if (!selection.nodes.has(it.id)) {
@@ -846,9 +1241,18 @@ function comfyNodeHTML(it) {
         previewNode(it);
       }
       if (it.type === "text" || it.type === "md") startTextEdit(it, el);
+      else if (it.hidden) window.showPrivateInspector?.();
       else if (it.type === "image" && it.fileId) openLightbox(it.fileId);
-      else if (it.type === "link" && it.url) window.open(it.url, "_blank");
-      else if (it.type === "group") previewNode(it);
+      else if (it.type === "link" && !ev.target.closest(".b-link-go")) openLinkNode(it);
+      else if (it.type === "group") {
+        // 双击标题格＝改名；双击空白＝只看信息
+        if (!ev.target.closest(".b-group-head")) { previewNode(it); return; }
+        const name = await appPrompt("分组名称", it.label || "分组");
+        if (name == null) return;
+        updateNodeFromInspector(it, name.trim() || "分组");
+        previewNode(it);
+        markDirty();
+      }
     });
 
     el.addEventListener("contextmenu", (ev) => {
@@ -973,12 +1377,20 @@ function comfyNodeHTML(it) {
       const dx = (e.clientX - sx) / board.scale;
       const dy = (e.clientY - sy) / board.scale;
       if (!moved && Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) < 2) return;
+      if (!moved) {
+        // 提成合成层：接下来的位移交给合成器做，旧位置由它擦除。
+        // 不走「每帧改 left/top → 重排 → 重绘」那条路——在 WebView2 的
+        // 硬件合成下，transform 层内子元素的旧栅格会被算漏，拖完留下一道
+        // 孤立的边框细线（残影）。
+        for (const d of drag) d.el.style.willChange = "transform";
+      }
       moved = true;
       for (const d of drag) {
         d.n.x = Math.round(d.ox + dx);
         d.n.y = Math.round(d.oy + dy);
-        d.el.style.left = d.n.x + "px";
-        d.el.style.top = d.n.y + "px";
+        // 父层有 scale(s)，子元素的位移会被一起缩放，所以这里直接写世界
+        // 坐标差即可，视觉位移正好是 差 × s。
+        d.el.style.transform = `translate3d(${d.n.x - d.ox}px, ${d.n.y - d.oy}px, 0)`;
       }
       redrawEdges();
       updateSelToolbar();
@@ -986,7 +1398,23 @@ function comfyNodeHTML(it) {
     const onUp = () => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
-      if (moved) markDirty();
+      if (moved) {
+        // 折算回 left/top：transform 的位移量正好等于新坐标减原坐标，
+        // 两者画面位置一致，撤掉时不跳变。
+        for (const d of drag) {
+          d.el.style.left = d.n.x + "px";
+          d.el.style.top = d.n.y + "px";
+          d.el.style.transform = "";
+        }
+        // 晚一帧再撤合成层：先让 left/top 这一帧栅格化完，再放层。
+        // 同一帧里又改布局又撤层，合成器撤层时的旧位图会残留一帧，
+        // 那又是一道残影。
+        requestAnimationFrame(() => {
+          for (const d of drag) d.el.style.willChange = "";
+          flushPaint();
+        });
+        markDirty();
+      }
     };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
@@ -1035,7 +1463,7 @@ function comfyNodeHTML(it) {
     const onUp = () => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
-      if (resized) { markDirty(); applyImgSrc(); }
+      if (resized) { markDirty(); applyImgSrc(); flushPaint(); }
     };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
@@ -1343,6 +1771,23 @@ function comfyNodeHTML(it) {
   }
 
   function updateStyleControls() {
+    // 选中的是节点还是连线，决定浮层里露哪几行
+    const hasNode = selection.nodes.size > 0;
+    const hasEdge = selection.edges.size > 0;
+    document.querySelectorAll("#style-pop .for-node").forEach((el) => { el.hidden = !hasNode; });
+    document.querySelectorAll("#style-pop .for-edge").forEach((el) => { el.hidden = !hasEdge; });
+    if (hasEdge) {
+      const e = edgeById([...selection.edges][0]) || {};
+      const route = ROUTES.includes(e.route) ? e.route : "curve";
+      document.querySelectorAll("#style-route button").forEach((b) =>
+        b.classList.toggle("active", b.dataset.route === route));
+      const arrow = e.fromEnd === "arrow" && e.toEnd === "arrow" ? "both"
+        : e.toEnd === "arrow" ? "end" : "none";
+      document.querySelectorAll("#style-arrow button").forEach((b) =>
+        b.classList.toggle("active", b.dataset.arrow === arrow));
+      document.querySelectorAll("#style-dash button").forEach((b) =>
+        b.classList.toggle("active", b.dataset.dash === (e.dash ? "1" : "0")));
+    }
     const n = primarySelectedNode();
     if (!n) return;
     const color = $("#style-text-color");
@@ -1418,6 +1863,7 @@ function comfyNodeHTML(it) {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
       wrap.classList.remove("panning");
+      flushPaint();
     };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
@@ -1462,6 +1908,7 @@ function comfyNodeHTML(it) {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
       box.remove();
+      if (selection.nodes.size > 1) window.showBoardMultiInspector?.(selection.nodes.size);
     };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
@@ -1479,6 +1926,7 @@ function comfyNodeHTML(it) {
     if (Math.abs(diff) < 0.002) {
       setZoom(zoomTarget, zoomAnchorPt?.x, zoomAnchorPt?.y);
       zoomRAF = null;
+      flushPaint();                 // 缩放收敛后清一次旧栅格
       return;
     }
     setZoom(board.scale + diff * 0.25, zoomAnchorPt?.x, zoomAnchorPt?.y);
@@ -1551,6 +1999,13 @@ function comfyNodeHTML(it) {
       const el = nodeEl(it.id);
       if (el) startTextEdit(it, el);
     } });
+    if (it.type === "link") {
+      items.push({ label: "打开链接", disabled: !linkHref(it), fn: () => openLinkNode(it) });
+      items.push({ label: "复制链接地址", disabled: !linkHref(it), fn: () => {
+        copyText(linkHref(it));
+        toast("已复制链接地址");
+      } });
+    }
     if (it.type === "image" && it.fileId) {
       items.push({ label: "打开大图", fn: () => openLightbox(it.fileId) });
       items.push({ label: "复制文件路径", fn: async () => {
@@ -1662,6 +2117,7 @@ function comfyNodeHTML(it) {
     rev = 0;
     savedRev = 0;
     selection = { nodes: new Set(), edges: new Set() };
+    resetHistory();
     if (!restoreViewport()) {
       board.scale = 1; board.panX = 120; board.panY = 80;
     }
@@ -1686,6 +2142,7 @@ function comfyNodeHTML(it) {
     if (!boards.length) {
       board.id = null; board.items = []; board.edges = [];
       selection = { nodes: new Set(), edges: new Set() };
+      resetHistory();
       render(); syncToolbar();
       return;
     }
@@ -1707,7 +2164,7 @@ function comfyNodeHTML(it) {
   }
 
   /* ---------- 添加节点 ---------- */
-  function addTextNode(world, text = "双击编辑文字") {
+  function addTextNode(world, text = "") {
     const c = world || toWorld(
       wrap.getBoundingClientRect().left + wrap.clientWidth / 2,
       wrap.getBoundingClientRect().top + wrap.clientHeight / 2);
@@ -1724,7 +2181,7 @@ function comfyNodeHTML(it) {
     previewNode(it);
   }
 
-  function addMarkdownNode(world, text = "# 新文档\n\n在这里写 Markdown。\n\n- 支持标题\n- 支持列表\n- 支持 `行内代码` 和 **粗体**") {
+  function addMarkdownNode(world, text = "# 新文档\n\n") {
     const c = world || toWorld(
       wrap.getBoundingClientRect().left + wrap.clientWidth / 2,
       wrap.getBoundingClientRect().top + wrap.clientHeight / 2);
@@ -1740,12 +2197,15 @@ function comfyNodeHTML(it) {
     setTimeout(() => $("#insp-node-text")?.focus(), 40);
   }
 
-  function addLinkNode(world, url = "https://") {
+  /* source 是 Markdown：[名称](链接地址)；只写地址也能用 */
+  function addLinkNode(world, source = "[链接名称](https://)") {
     const c = world || toWorld(
       wrap.getBoundingClientRect().left + wrap.clientWidth / 2,
       wrap.getBoundingClientRect().top + wrap.clientHeight / 2);
+    const raw = String(source || "").trim() || "[链接名称](https://)";
+    const text = LINK_MD_RE.test(raw) ? raw : `[${raw}](${raw})`;
     const it = {
-      id: uid("l"), type: "link", url,
+      id: uid("l"), type: "link", text, url: parseLinkSource(text).url,
       x: Math.round(c.x - 130), y: Math.round(c.y - 40), w: 260, h: 80,
     };
     board.items.push(it);
@@ -1811,46 +2271,82 @@ function comfyNodeHTML(it) {
       else if (kind === "md") addMarkdownNode(null);
       else if (kind === "group") addGroupNode(null);
       else if (kind === "link") {
-        const url = await appPrompt("链接地址：", "https://");
-        if (!url) return;
-        addLinkNode(null, url.trim());
+        const value = await appPrompt("链接（格式：[名称](链接地址)）", "[链接名称](https://)");
+        if (!value) return;
+        addLinkNode(null, value.trim());
       }
     });
   });
 
   /* ---------- 拖放图片上板（同一张图可重复放入） ---------- */
   const dimCache = new Map();
+
+  function dimOf(fileId) {
+    if (dimCache.has(fileId)) return Promise.resolve(dimCache.get(fileId));
+    return api("/api/meta/" + encodeURIComponent(fileId))
+      .then((m) => {
+        const dim = { w: m.pxw || 0, h: m.pxh || 0 };
+        dimCache.set(fileId, dim);
+        return dim;
+      })
+      .catch(() => {
+        const dim = { w: 0, h: 0 };
+        dimCache.set(fileId, dim);
+        return dim;
+      });
+  }
+
+  /* 一批图片按落点铺开：以落点为网格中心，最多四列 */
+  async function dropImagesAt(ids, pos) {
+    const list = (ids || []).filter(Boolean);
+    if (!list.length) return;
+    try {
+      await ensureBoard();
+    } catch (e) { toast("创建画板失败：" + (e && e.message ? e.message : e)); return; }
+    const cols = Math.min(4, Math.max(1, Math.ceil(Math.sqrt(list.length))));
+    const W = 220, GAP = 18;
+    const dims = await Promise.all(list.map(dimOf));
+    const heights = dims.map((d) => {
+      const ratio = d.w > 0 ? d.h / d.w : 1;
+      return Math.min(520, Math.max(120, Math.round(W * ratio)));
+    });
+    const totalW = cols * W + (cols - 1) * GAP;
+    const startX = Math.round(pos.x - totalW / 2);
+    const startY = Math.round(pos.y - Math.min(Math.max(...heights), 240) / 2);
+    const made = [];
+    let y = 0, rowH = 0;             // 每行按这一行最高的那张定行高，不整批取最大值
+    list.forEach((fileId, i) => {
+      const col = i % cols;
+      if (col === 0 && i > 0) { y += rowH + GAP; rowH = 0; }
+      const node = normalizeNode({
+        id: uid("n"), type: "image", fileId,
+        x: startX + col * (W + GAP), y: startY + y, w: W, h: heights[i],
+      });
+      board.items.push(node);
+      made.push(node.id);
+      rowH = Math.max(rowH, heights[i]);
+    });
+    selection = { nodes: new Set(made), edges: new Set() };
+    markDirty();
+    render();
+    if (made.length > 1) window.showBoardMultiInspector?.(made.length);
+    await save();
+  }
+
   wrap.addEventListener("dragover", (ev) => {
     ev.preventDefault();
     ev.dataTransfer.dropEffect = "copy";
   });
   wrap.addEventListener("drop", async (ev) => {
     ev.preventDefault();
-    const fileId = ev.dataTransfer.getData("text/texture-id");
-    if (!fileId) return;
+    // 多选后拖一张：把整批都带过来
+    let ids = [ev.dataTransfer.getData("text/texture-id")].filter(Boolean);
     try {
-      await ensureBoard();
-    } catch (e) { toast("创建画板失败：" + (e && e.message ? e.message : e)); return; }
-    if (!dimCache.has(fileId)) {
-      try {
-        const m = await api("/api/meta/" + encodeURIComponent(fileId));
-        dimCache.set(fileId, { w: m.pxw || 0, h: m.pxh || 0 });
-      } catch { dimCache.set(fileId, { w: 0, h: 0 }); }
-    }
-    const dim = dimCache.get(fileId);
-    const ratio = dim.w > 0 ? dim.h / dim.w : 1;
-    const pos = toWorld(ev.clientX, ev.clientY);
-    const w = 220;
-    const h = Math.min(520, Math.max(120, Math.round(w * ratio)));
-    const node = normalizeNode({
-      id: uid("n"), type: "image", fileId,
-      x: Math.round(pos.x - w / 2), y: Math.round(pos.y - h / 2), w, h,
-    });
-    board.items.push(node);
-    selection = { nodes: new Set([node.id]), edges: new Set() };
-    markDirty();
-    render();
-    await save();
+      const batch = JSON.parse(ev.dataTransfer.getData("text/texture-ids") || "[]");
+      if (Array.isArray(batch) && batch.length) ids = batch.filter((x) => typeof x === "string");
+    } catch { /* 旧格式只带单张 */ }
+    if (!ids.length) return;
+    await dropImagesAt(ids, toWorld(ev.clientX, ev.clientY));
   });
 
   /* ---------- 素材抽屉：跟随左侧文件夹 + 可选标签 ---------- */
@@ -1922,8 +2418,10 @@ function comfyNodeHTML(it) {
     }, { root: null, rootMargin: "300px" }));
 
     for (const it of data.items.slice(0, 400)) {
-      const cell = createAssetCell(it, { onClick: () => {
-        if (typeof selectImage === "function") selectImage(it.id);
+      const cell = createAssetCell(it, { onClick: (ev, el) => {
+        // 抽屉里的多选和图库共用一份：Ctrl/Cmd 点切换、Shift 连选、普通点单选
+        if (typeof window.pickAsset === "function") window.pickAsset(ev, it, el);
+        else if (typeof selectImage === "function") selectImage(it.id);
         if (typeof setInspector === "function") setInspector(true);
       } });
       cell.classList.add("drawer-cell");
@@ -2139,6 +2637,11 @@ function comfyNodeHTML(it) {
     }
   });
 
+  /* ---------- 撤销 / 重做按钮 ---------- */
+  $("#board-undo").addEventListener("click", () => undo());
+  $("#board-redo").addEventListener("click", () => redo());
+  updateUndoUI();
+
   /* ---------- 缩放按钮 ---------- */
   $("#zoom-in").addEventListener("click", () => zoomAtCenter(1.2));
   $("#zoom-out").addEventListener("click", () => zoomAtCenter(1 / 1.2));
@@ -2166,6 +2669,50 @@ function comfyNodeHTML(it) {
     }
   });
   $("#style-pop").addEventListener("mousedown", (ev) => ev.stopPropagation());
+
+  /* 连线样式：选中一条或多条边时，浮层里直接改走线 / 箭头 / 线型 */
+  $("#style-route").addEventListener("click", (ev) => {
+    const b = ev.target.closest("button[data-route]");
+    if (!b || !selection.edges.size) return;
+    ev.stopPropagation();
+    for (const id of selection.edges) {
+      const e = edgeById(id);
+      if (e) e.route = b.dataset.route;
+    }
+    markDirty();
+    render();
+    updateStyleControls();
+  });
+  $("#style-arrow").addEventListener("click", (ev) => {
+    const b = ev.target.closest("button[data-arrow]");
+    if (!b || !selection.edges.size) return;
+    ev.stopPropagation();
+    const v = b.dataset.arrow;
+    for (const id of selection.edges) {
+      const e = edgeById(id);
+      if (!e) continue;
+      if (v === "end") { e.toEnd = "arrow"; delete e.fromEnd; }
+      else if (v === "both") { e.toEnd = "arrow"; e.fromEnd = "arrow"; }
+      else { delete e.toEnd; delete e.fromEnd; }
+    }
+    markDirty();
+    render();
+    updateStyleControls();
+  });
+  $("#style-dash").addEventListener("click", (ev) => {
+    const b = ev.target.closest("button[data-dash]");
+    if (!b || !selection.edges.size) return;
+    ev.stopPropagation();
+    const on = b.dataset.dash === "1";
+    for (const id of selection.edges) {
+      const e = edgeById(id);
+      if (!e) continue;
+      if (on) e.dash = true; else delete e.dash;
+    }
+    markDirty();
+    render();
+    updateStyleControls();
+  });
   $("#style-text-color").addEventListener("input", (ev) =>
     setSelectionTextStyle({ textColor: ev.target.value }));
   $("#style-text-default").addEventListener("click", () =>
@@ -2189,9 +2736,9 @@ function comfyNodeHTML(it) {
     pop.hidden = true;
   });
 
-  /* ---------- 白板键盘 ---------- */
-  document.addEventListener("keydown", (ev) => {
+  /* ---------- 白板键盘 ---------- */  document.addEventListener("keydown", (ev) => {
     if ($("#view-board").hidden || editingText) return;
+    if (!$("#prefs").hidden) return;
     if (!$("#lightbox").hidden) return;
     const t = document.activeElement;
     if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
@@ -2212,7 +2759,12 @@ function comfyNodeHTML(it) {
     if (Hotkeys.match(ev, "board.group")) {
       ev.preventDefault(); $("#canvas-dock button[data-add='group']")?.click(); return;
     }
-    if (Hotkeys.match(ev, "gallery.panel")) { Hotkeys.renderPanel(); $("#shortcuts").hidden = !$("#shortcuts").hidden; return; }
+    if (Hotkeys.match(ev, "board.undo")) { ev.preventDefault(); undo(); return; }
+    if (Hotkeys.match(ev, "board.redo") || (mod && ev.key.toLowerCase() === "y")) {
+      ev.preventDefault(); redo(); return;
+    }
+    if (Hotkeys.match(ev, "app.search")) { ev.preventDefault(); focusSearch(); return; }
+    if (Hotkeys.match(ev, "app.prefs")) { ev.preventDefault(); openPrefs(); return; }
     if (Hotkeys.match(ev, "gallery.info")) {
       setInspector(!$("#main").classList.contains("insp-open")); return;
     }
@@ -2270,7 +2822,12 @@ function comfyNodeHTML(it) {
     const originY = wide ? Math.round((r.height / 2 - board.panY) / board.scale) - 90 : 80;
     const cols = Math.min(4, Math.max(1, Math.ceil(Math.sqrt(ids.length))));
     const W = 200, GAP = 26;
-    let col = 0, x = originX, y = originY, rowH = 0;
+    // 画板上已经有东西时，整批落在现有内容的下面，别直接压在原图上
+    const baseY = board.items.length
+      ? Math.round(Math.max(...board.items.map((n) => n.y + n.h)) + 48)
+      : originY;
+    let col = 0, x = originX, y = baseY, rowH = 0;
+    const made = [];
     for (const fid of ids) {
       let dim = dimCache.get(fid);
       if (!dim) {
@@ -2287,16 +2844,22 @@ function comfyNodeHTML(it) {
         id: uid("n"), type: "image", fileId: fid, x, y, w: W, h,
       });
       board.items.push(node);
+      made.push(node.id);
       x += W + GAP;
       rowH = Math.max(rowH, h);
       col++;
     }
+    // 整批进来就是整批选中：到画板后可以直接拖/改，不用再一张张点
+    if (made.length) selection = { nodes: new Set(made), edges: new Set() };
     markDirty();
     render();
+    if (made.length > 1) window.showBoardMultiInspector?.(made.length);
     await save();
     if (fromGallery && typeof switchView === "function") {
       pendingFit = true;
       switchView("board");
+    } else if (made.length) {
+      fitView();          // 已经在画板上：把视图挪到刚放进来这批，别让人自己找
     }
     return ids.length;
   };
@@ -2310,6 +2873,18 @@ function comfyNodeHTML(it) {
   };
 
   window.onLeaveBoard = async () => { await flushSave(); };
+  // 隐私开关一变就重取当前画板：图片节点该藏就藏，该回就回
+  window.boardApplyPrivacy = async () => {
+    if (board.id == null) return;
+    const boardVisible = !$("#view-board").hidden;
+    await flushSave();
+    await loadBoard(board.id, { skipSave: true });
+    // 在图库里就恢复图库的信息栏；在画板上则保持原样，等用户点节点
+    if (!boardVisible) restoreGalleryInspector();
+    else window.hidePrivateInspector?.();
+  };
+  // 右侧介绍栏要用同一套解析，避免画布和侧栏对同一节点显示不一样
+  window.boardLinkInfo = linkInfo;
 
   window.addEventListener("pagehide", () => {
     if (board.id == null || rev === savedRev) return;
@@ -2323,7 +2898,14 @@ function comfyNodeHTML(it) {
     } catch { /* 关闭页时尽力而为 */ }
   });
 
-  window.addEventListener("resize", () => updateSelToolbar());
+  window.addEventListener("resize", () => { updateSelToolbar(); flushPaint(); });
+
+  /* 偏好设置里改画布字体/字号：CSS 变量立刻生效，但标签框是按文字外框量出来的，
+     字号一变就得重新量一遍，否则文字会撑出框外。 */
+  window.addEventListener("texture:boardtext", () => {
+    requestAnimationFrame(() =>
+      canvas.querySelectorAll("g[data-edge]").forEach(fitEdgeLabel));
+  });
 
   buildColorSwatches();
   syncDrawerOpts();
